@@ -682,6 +682,10 @@ class GRPOConfig(TrainingArguments):
         default = "s_valid",
         metadata={"help": "Comparison mode to use for computing 'reward', 'advantage'. Options are 's_valid', 'all'"}
     )
+    correctness_reward_func_type: Optional[str] = field(
+        default = "binary",
+        metadata={"help": "Reward function mode for correctness. Options are 'binary', 'continuous'"}
+    )
 
     # [Custom] Parameters for Gated Methodology
     div_threshold: Optional[float] = field(
