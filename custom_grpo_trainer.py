@@ -261,8 +261,8 @@ class ValSETrainer(GRPOTrainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
         rollout_func: Optional[RolloutFunc] = None,
-        reward_func_correctness: Callable, # A function to compute correctness reward
-        reward_func_similarity: Callable, # A function to compute similarity reward (S(C_a, C_b))
+        reward_func_correctness: Callable = None, # A function to compute correctness reward
+        reward_func_similarity: Callable = None, # A function to compute similarity reward (S(C_a, C_b))
         w_div: float = 0.5, # Weight for diversity reward
         lambda_div: float = 1.0, # R_Div = -lambda_div * S_max
         **kwargs,
@@ -650,6 +650,10 @@ class ValSETrainer(GRPOTrainer):
 
         # [Custom] Add options for Adapters (Main, Specialist1, Specialist2)
         self.base_adapter_name = "main"
+        self.training_mode = self.args.training_mode
+        if self.training_mode not in ["originalGRPOMode", "ValSE", "OneAdapterMode"]:
+            raise ValueError(f"Unsupported training_mode: {self.training_mode}")
+        # Also, depends on the training mode, determine to use Parent Class
         self.specialist_a = self.args.specialists_a
         self.specialist_b = self.args.specialists_b
         self.k_base = self.args.num_base_candidates
@@ -657,6 +661,7 @@ class ValSETrainer(GRPOTrainer):
         self.k_total = self.k_base + len(self.specialist_names) * self.k_specialist
         # Debug info
         print(f" ---- Trainer Settings ---- ")
+        print(f"   >> Training Mode: {self.training_mode}")
         print(f"   >> Used Adapters: Main + {self.specialist_names} / Total {len(self.specialist_names)+1}")
         print(f"   >> # Base Candidates: {self.k_base}")
         print(f"   >> # Specialist Candidates per Specialist: {self.k_specialist}")
@@ -1427,52 +1432,6 @@ class ValSETrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
-        device = self.accelerator.device
-        z_score = standardization_func
-        mode = "train" if self.model.training else "eval"
-
-        prompts = [x["prompt"] for x in inputs]
-
-        if "images" in inputs[0]:
-            images = [example.get("images") for example in inputs]
-        elif "image" in inputs[0]:
-            images = [[example.get("image")] if example.get("image") is not None else None for example in inputs]
-        else:
-            images = None
-        # Transformers requires at least one image in the batch, otherwise it throws an error
-        if images is not None and all(img_list == [] for img_list in images):
-            images = None
-
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
-        # [{"role": "user", "content": "What color is the sky?"}] to
-        # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
-        if images is not None:
-            prompts = [prepare_multimodal_messages(prompt, image_list) for prompt, image_list in zip(prompts, images)]
-
-        # ==============
-        # [Custom] 
-        # Sampling Phase -> _generate_single_turn
-        C_Base_samples = self._generate_with_adapter(inputs, self.base_adapter_name, self.k_base)
-        C_Sa_samples = self._generate_with_adapter(inputs, self.specialist_a, self.k_specialist)
-        C_Sb_samples = self._generate_with_adapter(inputs, self.specialist_b, self.k_specialist)
-
-        # prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-        #     self._generate(prompts)
-        # )
-        prompts, C_total, C_total_ids, batch = self._generate_with_adapter(inputs)
-
-        # Compute Correctness rewards for all completions
-        rw_correctness_list = torch.tensor(
-            self.reward_func_correctness(prompts = prompts, completions = C_total, **batch),
-            dtype=torch.float32,
-            device=device,
-        ) # For correctness, total is 10
-        adv_correctness_list = z_score(rw_correctness_list)
-
-        # Compute Diversity rewards -- Advantages are different depends on S_valid filtering
-        rw_diversity_list = torch.tensor(self.k_total, device = device)
-        adv_diversity_list = z_score(rw_diversity_list)
-        rw_diversity_valid_cands = {}
 
         """
             Seperate these....
@@ -1489,311 +1448,114 @@ class ValSETrainer(GRPOTrainer):
             아아....
         """
 
-        start_idx = 0
-        start_idx += self.k_base # Base (adv_diversity == 0); It doesn;t contribute to diversity
-        specialist_groups = {
-            self.specialist_a: C_Sa_samples,
-            self.specialist_b: C_Sb_samples,
-        }
+        z_score = standardization_func
+        mode = "train" if self.model.training else "eval"
 
-        for specialist_idx, (specialist_name, C_specialist_samples) in enumerate(specialist_groups.items()):
-            # Compare with base model and the another adapter
-            compare_group = C_Base_samples + specialist_groups[self.specialist_a if specialist_name == self.specialist_b else self.specialist_b]
+        # Set up differently depends on Training mode setting
+        if self.training_mode == "originalGRPOMode":
+            print("  >> Running in Standard GRPO Mode (Original) <<  ")
+            return super()._generate_and_score_completions(inputs)
 
-            for k in range(self.k_specialist):
-                original_idx = start_idx + k
+        # ValSE and OneAdapterMode use the same generation and scoring pipeline, only differ in the adapter setup of number.
+        elif self.training_mode == "ValSE" or self.training_mode == "OneAdapterMode":
+            print("  >> Running in ValSE Mode <<  ")
+            device = self.accelerator.device
+            if self.training_mode == "ValSE":
+                specialist_adapter_list = [self.specialist_a, self.specialist_b]
+            elif self.training_mode == "OneAdapterMode":
+                specialist_adapter_list = [self.specialist_a] # Only use one specialist adapter
 
-                # For S_valid group (which also considers Correctness)
-                if self.args.reward_func_correctness_type == "binary": # Set again, if type is binary, it's metrics such as exact_match
-                    if rw_correctness_list[original_idx] == 1:
-                        C_i = C_total[original_idx]
+            # ==============
+            # [Custom] 
+            # Sampling Phase -> _generate_single_turn
+            C_Base_samples = self._generate_with_adapter(inputs, self.base_adapter_name, self.k_base)
+            C_Sa_samples = self._generate_with_adapter(inputs, self.specialist_a, self.k_specialist)
+            C_Sb_samples = self._generate_with_adapter(inputs, self.specialist_b, self.k_specialist)
 
-                        # Compute Diversity reward
-                        max_similarity = max([self.reward_func_similarity(C_i, C_j) for C_j in compare_group])
-                        rw_diversity_score = - self.lambda_diversity * max_similarity
-                        # 아 여기 다시.. 다시....
+            # prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
+            #     self._generate(prompts)
+            # )
+            prompts, C_total, C_total_ids, batch = self._generate_with_adapter(inputs)
 
-                elif reward_func_correctness_type == "continuous": # e.g., F1 score
-                    # Not set yet
+            # Compute Correctness rewards for all completions
+            rw_correctness_list = torch.tensor(
+                self.reward_func_correctness(prompts = prompts, completions = C_total, **batch),
+                dtype=torch.float32,
+                device=device,
+            ) # For correctness, total is 10
+            adv_correctness_list = z_score(rw_correctness_list)
 
-        # Two cases to compute Diversity reward, adv; one is for S_valid, another is for all from specialists
-        if self.compare_mode == "s_valid": 
-            if len(rw_diversity_valid_cands) > 1:
-                valid_indices = list(rw_diversity_valid_cands.keys())
-                rw_valid_diversity_cands_score = torch.tensor(list(rw_diversity_valid_cands.values()))
+            # Compute Diversity rewards -- Advantages are different depends on S_valid filtering
+            rw_diversity_list = torch.tensor(self.k_total, device = device)
+            adv_diversity_list = z_score(rw_diversity_list)
+            rw_diversity_valid_cands = {}
 
-                adv_valid_diversity_cands_score = z_score(rw_valid_diversity_cands_score)
-                adv_diversity_list[valid_indices] = adv_valid_diversity_cands_score
-        elif self.compare_mode == "all":
-            pass # already computed above
-            # 아 아 아 아 다시 ... 다시.....
-        else:
-            raise ValueError(f"Invalid compare_mode: {self.compare_mode}")
+            start_idx = self.k_base
 
-        adv_total_list = adv_correctness_list + self.w_div * adv_diversity_list
+            specialist_groups_texts = {
+                self.specialist_adapter_list[0]: C_total[self.k_base : self.k_base + self.k_specialist],
+                self.specialist_adapter_list[1]: C_total[self.k_base + self.k_specialist : ],
+            }
+            
+            for specialist_idx, adapter in enumerate(self.specialist_adapter_list):
+                # Compare with base model and the another adapter
+                compare_group = C_total[:self.k_base] + specialist_groups_texts[self.specialist_adapter_list[1 - specialist_idx]]
 
-        prompt_ids, prompt_mask, completion_ids, completion_mask, old_per_token_logps, ref_per_token_logps = (
-            self._generate_with_adapter(C_total_ids)
-        )
+                for k in range(self.k_specialist):
+                    original_idx = start_idx + k
 
-        return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "old_per_token_logps": old_per_token_logps,
-            "ref_per_token_logps": ref_per_token_logps,
-            "advantages": adv_total_list,
-            "rewards_correctness": rw_correctness_list,
-            "rewards_diversity": rw_diversity_list,
-        }
+                    # For S_valid group (which also considers Correctness)
+                    if self.args.correctness_reward_func_type == "binary": # Set again, if type is binary, it's metrics such as exact_match
+                        if rw_correctness_list[original_idx] == 1:
+                            C_i = C_total[original_idx]
 
-    
-        # ==============
-        # # Convert lists of token IDs to padded tensors
-        # prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
-        # prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
-        # prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
-        # prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
-        # completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
-        # completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
-        # completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
-        # completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
-        # if sampling_per_token_logps_list is not None:
-        #     sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in sampling_per_token_logps_list]
-        #     sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
-        # else:
-        #     sampling_per_token_logps = None
+                            # Compute Diversity reward
+                            max_similarity = max([self.reward_func_similarity(C_i, C_j) for C_j in compare_group])
+                            rw_diversity_score = - self.lambda_diversity * max_similarity
+                            rw_diversity_list[original_idx] = rw_diversity_score
+                            rw_diversity_valid_cands[original_idx] = rw_diversity_score
 
-        # # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
-        # if self.mask_truncated_completions:
-        #     eos_and_pad = [self.eos_token_id, self.pad_token_id]
-        #     is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
-        #     completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+                            # Two cases to compute Diversity reward, adv; one is for S_valid, another is for all from specialists
+                            if self.compare_mode == "s_valid": 
+                                if len(rw_diversity_valid_cands) > 1:
+                                    valid_indices = list(rw_diversity_valid_cands.keys())
+                                    rw_valid_diversity_cands_score = torch.tensor(list(rw_diversity_valid_cands.values()))
 
-        # # Concatenate prompt_mask with completion_mask for logit computation
-        # prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
-        # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+                                    adv_valid_diversity_cands_score = z_score(rw_valid_diversity_cands_score)
+                                    adv_diversity_list[valid_indices] = adv_valid_diversity_cands_score
+                            elif self.compare_mode == "all":
+                                pass # already computed above
+                                # 아 아 아 아 다시 ... 다시.....
+                            else:
+                                raise ValueError(f"Invalid compare_mode: {self.compare_mode}")
+                            
+                        else: # Which has incorrect final answer
+                            rw_diversity_score = 0.0 # -> No diversity reward if the correctness is not met
+                            rw_diversity_list[original_idx] = rw_diversity_score
 
-        # logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        # batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+                    elif self.args.correctness_reward_func_type == "continuous": # e.g., F1 score
+                        # Not set yet 
+                        pass # NEED TO MODIFY
 
-        # num_images = [len(img_list) for img_list in images] if images is not None else None
+                start_idx += self.k_specialist
 
-        # # Get forward_kwargs for models with multimodal inputs
-        # if images is not None:
-        #     prompts_text = [
-        #         apply_chat_template({"prompt": prompt}, self.processing_class, **self.chat_template_kwargs)["prompt"]
-        #         for prompt in prompts
-        #     ]
-        #     prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
-        #     prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        #     forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
-        # else:
-        #     forward_kwargs = {}
+            adv_total_list = adv_correctness_list + self.w_div * adv_diversity_list
 
-        # # If token_type_ids are used, extend them with zeros for the completion part
-        # if "token_type_ids" in forward_kwargs:
-        #     token_type_ids = forward_kwargs["token_type_ids"]
-        #     forward_kwargs["token_type_ids"] = torch.cat(
-        #         [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
-        #     )
+            prompt_ids, prompt_mask, completion_ids, completion_mask, old_per_token_logps, ref_per_token_logps = (
+                self._generate_with_adapter(C_total_ids)
+            )
 
-        # with torch.no_grad():
-        #     # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-        #     # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-        #     # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-        #     # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-        #     # old_per_token_logps to None.
-        #     # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-        #     # distribution mismatch between vLLM and the training model can be large and harm the training.
-        #     generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-        #     if self.args.gradient_accumulation_steps % generate_every != 0 or (
-        #         self.use_vllm and self.vllm_importance_sampling_correction
-        #     ):
-        #         old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-        #             self.model,
-        #             prompt_completion_ids,
-        #             attention_mask,
-        #             logits_to_keep,
-        #             batch_size,
-        #             num_images=num_images,
-        #             **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-        #         )
-        #     else:
-        #         old_per_token_logps = None
-
-        #     # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-        #     if self.use_vllm and self.vllm_importance_sampling_correction:
-        #         importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
-        #         importance_sampling_ratio = torch.clamp(
-        #             importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-        #         )
-
-        #     # Compute the per-token log probabilities for the reference model
-        #     if self.beta != 0.0:
-        #         if self.ref_model is not None:
-        #             ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-        #                 self.ref_model,
-        #                 prompt_completion_ids,
-        #                 attention_mask,
-        #                 logits_to_keep,
-        #                 batch_size=batch_size,
-        #                 num_images=num_images,
-        #                 **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-        #             )
-        #         else:
-        #             with self.accelerator.unwrap_model(self.model).disable_adapter():
-        #                 ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-        #                     self.model,
-        #                     prompt_completion_ids,
-        #                     attention_mask,
-        #                     logits_to_keep,
-        #                     batch_size=batch_size,
-        #                     num_images=num_images,
-        #                     **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-        #                 )
-        #     else:
-        #         ref_per_token_logps = None
-
-        # # Decode
-        # prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        # completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        # if is_conversational(inputs[0]):
-        #     completions = []
-        #     for prompt, completion in zip(prompts, completions_text):
-        #         bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-        #         completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        # else:
-        #     completions = completions_text
-
-        # # Merge extra_fields from rollout_func into inputs for reward functions
-        # if extra_fields:
-        #     for i, inp in enumerate(inputs):
-        #         for key, values in extra_fields.items():
-        #             if isinstance(values, list) and i < len(values):
-        #                 inp[key] = values[i]
-        #             elif not isinstance(values, list):
-        #                 inp[key] = values
-
-        # # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
-        # # important because rewards will be normalized per group, and completions are distributed. We will later slice
-        # # rewards_per_func to extract each process's subset.
-        # rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
-
-        # # Apply weights to each reward function's output and sum
-        # rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-
-        # # Compute grouped-wise rewards
-        # mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-
-        # # Normalize the rewards to compute the advantages
-        # mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        # advantages = rewards - mean_grouped_rewards
-
-        # if self.scale_rewards in ["group", "none"]:
-        #     # If self.scale_rewards = "none", we'll still log group level std
-        #     std_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        #     std_rewards = std_rewards.repeat_interleave(self.num_generations, dim=0)
-        # elif self.scale_rewards == "batch":
-        #     # Compute global std
-        #     std_rewards = rewards.std().expand_as(rewards)
-        # else:
-        #     raise ValueError(
-        #         f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
-        #     )
-
-        # is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-        # if self.scale_rewards != "none":
-        #     advantages = advantages / (std_rewards + 1e-4)
-
-        # # Slice to keep only the local part of the data
-        # process_slice = slice(
-        #     self.accelerator.process_index * len(prompts),
-        #     (self.accelerator.process_index + 1) * len(prompts),
-        # )
-        # all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
-        # advantages = advantages[process_slice]
-
-        # # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-        # for i, reward_func_name in enumerate(self.reward_func_names):
-        #     mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-        #     self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-        #     std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-        #     self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        # self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        # self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-        # self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-
-        # # Log prompt and completion texts
-        # self._logs["prompt"].extend(gather_object(prompts_text))
-        # self._logs["completion"].extend(gather_object(completions_text))
-        # for i, name in enumerate(self.reward_func_names):
-        #     self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        # self._logs["advantages"].extend(all_process_advantages.tolist())
-
-        # if images is not None:
-        #     self._logs["images"].extend(gather_object(images))
-
-        # if self.use_vllm and self.vllm_importance_sampling_correction:
-        #     delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-        #     delta = delta[completion_mask.bool()]
-        #     mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-        #     max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-        #     self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-        #         self.accelerator.gather(mean_delta).mean().item()
-        #     )
-        #     self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-        #         self.accelerator.gather(max_delta).max().item()
-        #     )
-
-        #     flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
-        #     min_importance_sampling_ratio = (
-        #         torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        #     )
-        #     mean_importance_sampling_ratio = (
-        #         torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        #     )
-        #     max_importance_sampling_ratio = (
-        #         torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        #     )
-        #     self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-        #         nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-        #     )
-        #     self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-        #         self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-        #     )
-        #     self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-        #         nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-        #     )
-
-        # output = {
-        #     "prompt_ids": prompt_ids,
-        #     "prompt_mask": prompt_mask,
-        #     "completion_ids": completion_ids,
-        #     "completion_mask": completion_mask,
-        #     "advantages": advantages,
-        #     "num_items_in_batch": num_items_in_batch,
-        # }
-        # if old_per_token_logps is not None:
-        #     output["old_per_token_logps"] = old_per_token_logps
-        # if self.use_vllm and self.vllm_importance_sampling_correction:
-        #     output["importance_sampling_ratio"] = importance_sampling_ratio
-        # if ref_per_token_logps is not None:
-        #     output["ref_per_token_logps"] = ref_per_token_logps
-        # if "pixel_values" in forward_kwargs:
-        #     output["pixel_values"] = forward_kwargs["pixel_values"]
-        # if "image_grid_thw" in forward_kwargs:
-        #     output["image_grid_thw"] = forward_kwargs["image_grid_thw"]
-        # if "pixel_attention_mask" in forward_kwargs:
-        #     output["pixel_attention_mask"] = forward_kwargs["pixel_attention_mask"]
-        # if "image_sizes" in forward_kwargs:
-        #     output["image_sizes"] = forward_kwargs["image_sizes"]
-        # if "token_type_ids" in forward_kwargs:
-        #     output["token_type_ids"] = forward_kwargs["token_type_ids"]
-        # if images is not None:
-        #     output["num_images"] = num_images
-        # return output
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "completion_ids": completion_ids,
+                "completion_mask": completion_mask,
+                "old_per_token_logps": old_per_token_logps,
+                "ref_per_token_logps": ref_per_token_logps,
+                "advantages": adv_total_list,
+                "rewards_correctness": rw_correctness_list,
+                "rewards_diversity": rw_diversity_list,
+            }
 
     # [Custom] Generate with adapter
     def _generate_with_adapter(self, inputs: list[dict[str, Union[torch.Tensor, Any]]], adapter_name: str, k: int):
@@ -1858,52 +1620,20 @@ class ValSETrainer(GRPOTrainer):
         else:
             return self._compute_loss(model, inputs)
 
-    def _compute_loss(self, model, inputs):
-        # Compute the per-token log probabilities for the model
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            num_images=inputs.get("num_images"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-            token_type_ids=inputs.get("token_type_ids"),
-        )
-
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
-        else:
-            entropy_mask = None
-
-        # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-
-        # Compute the loss
-        advantages = inputs["advantages"]
-        # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
-        # old_per_token_logps == per_token_logps. In this case we can skip its computation
-        # (see _generate_and_score_completions) and instead use per_token_logps.detach().
-        # The exception is when using vLLM, where we always compute old_per_token_logps
-        # for importance sampling
-        old_per_token_logps = inputs.get("old_per_token_logps")
+    def _calculate_grpo_loss (
+            self,
+            per_token_logps: torch.Tensor,
+            old_per_token_logps: torch.Tensor,
+            ref_per_token_logps: torch.Tensor,
+            advantages: torch.Tensor,
+            completion_mask: torch.Tensor,
+            entropies: torch.Tensor,
+            adapter_name: str = None,
+        ):
+        # Uses the original GRPO loss computation from the base class
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-
         log_ratio = per_token_logps - old_per_token_logps
+
         if self.importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == "sequence":
@@ -1927,6 +1657,15 @@ class ValSETrainer(GRPOTrainer):
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        if self.top_entropy_quantile < 1.0:
+            entropy_mask = self.get_high_entropy_mask(
+                entropies, adapter_name=adapter_name, quantile=self.top_entropy_quantile
+            )
+        else:
+            entropy_mask = None
+
+
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
@@ -1934,6 +1673,118 @@ class ValSETrainer(GRPOTrainer):
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        if self.loss_type == "grpo":
+            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "bnpo":
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "dr_grpo":
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "dapo":
+            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+            loss = (per_token_loss * completion_mask).sum() / normalizer
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Log the metrics
+        mode = "train" if self.model.training else "eval"
+
+        completion_token_count = completion_mask.sum().clamp(min=1.0)
+
+        def masked_batch_mean(x):
+            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+                return x.mean()
+            else:
+                return (x * completion_mask).sum() / completion_token_count
+
+        if self.beta != 0.0:
+            mean_kl = masked_batch_mean(per_token_kl)
+            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+
+        mean_entropy = masked_batch_mean(entropies)
+        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+        # Compute the clipped probability ratios
+        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_region_clipped = is_low_clipped | is_high_clipped
+
+        low_clip = masked_batch_mean(is_low_clipped.float())
+        high_clip = masked_batch_mean(is_high_clipped.float())
+        clip_ratio = masked_batch_mean(is_region_clipped.float())
+
+        gathered_low_clip = self.accelerator.gather(low_clip)
+        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
+        gathered_high_clip = self.accelerator.gather(high_clip)
+        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
+        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+    def _calculate_grpo_loss (
+            self,
+            per_token_logps: torch.Tensor,
+            old_per_token_logps: torch.Tensor,
+            ref_per_token_logps: torch.Tensor,
+            advantages: torch.Tensor,
+            completion_mask: torch.Tensor,
+            entropies: torch.Tensor,
+            adapter_name: str = None,
+        ):
+        # Uses the original GRPO loss computation from the base class
+        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+        log_ratio = per_token_logps - old_per_token_logps
+
+        if self.importance_sampling_level == "token":
+            log_importance_weights = log_ratio
+        elif self.importance_sampling_level == "sequence":
+            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            log_importance_weights = log_importance_weights.unsqueeze(-1)
+        else:
+            raise ValueError(
+                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
+                "and 'sequence'."
+            )
+        # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
+        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+
+        coef_1 = torch.exp(log_importance_weights)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+        # Two-sided clipping
+        if self.args.delta is not None:
+            coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        if self.top_entropy_quantile < 1.0:
+            entropy_mask = self.get_high_entropy_mask(
+                entropies, adapter_name=adapter_name, quantile=self.top_entropy_quantile
+            )
+        else:
+            entropy_mask = None
+
+
+        if entropy_mask is not None:
+            per_token_loss = per_token_loss * entropy_mask
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+
+        if self.beta != 0.0:
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.loss_type == "grpo":
@@ -1988,7 +1839,10 @@ class ValSETrainer(GRPOTrainer):
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 
-    def _custom_compute_loss(self, model, inputs, return_outputs=False):
+        return loss
+
+    def _compute_loss(self, model, inputs, return_outputs=False): # Overwrite the original _compute_loss
+        
         """
             For Computing cases with multi-adapters
 
@@ -1996,116 +1850,72 @@ class ValSETrainer(GRPOTrainer):
             * L_Specialists: Compute log_probs for only the specialist completions (k=3 for each)
             * L_Total = L_Base + L_Specialists_{}
         """
-        if return_outputs:
-            raise ValueError("ValSETrainer does not support returning outputs")
+        if self.training_mode == "originalGRPOMode":
+            print("  >> Computing Loss as Standard GRPO Mode (Original) <<  ")
+            return super()._compute_loss(model, inputs, return_outputs)
         
-        # Get adv_totals from '_generate_and_score_completions'
-        advantages = inputs["advantages"] # (K = 10)
+        elif self.training_mode == "ValSE" or self.training_mode == "OneAdapterMode":
+            print("  >> Computing Loss with new proposing one, ValSE Mode <<  ")       
 
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        unwrapped_model.set_adapter(self.base_adapter_name)
+            # Get adv_totals from '_generate_and_score_completions'
+            advantages = inputs["advantages"] # (K = 10)
+            completion_mask = inputs["completion_mask"]
+            unwrapped_model = self.accelerator.unwrap_model(model)
 
-        log_probs_base, entropies_base = self._get_per_token_logps_and_entropies( # Not sure to use entropies but ... compute first
-            model,
-            inputs["prompt_ids"],
-            inputs["prompt_mask"],
-            inputs["completion_ids"],
-            inputs["completion_mask"],
-        )
+            # L_Base computation (Distill Loss)
+            unwrapped_model.set_adapter(self.base_adapter_name)
 
-        # L_Base computation
-        L_Base = self._compute_loss(
-            log_probs_base,
-            inputs["old_per_token_logps"],
-            inputs["ref_per_token_logps"],
-            advantages, # adv_total
-            inputs["completion_mask"],
-        )
-
-        # L_Specialists computation
-        L_Specialists = 0.0
-        start_index = self.k_base
-        if self.specialist_a == True and self.specialist_b == True:
-            specialist_adapters = [self.specialist_a, self.specialist_b]
-        elif self.specialist_a == True:
-            specialist_adapters = [self.specialist_a]
-        elif self.specialist_b == True:
-            specialist_adapters = [self.specialist_b]
-        else:
-            specialist_adapters = []
-
-        for specialist_name in specialist_adapters:
-            unwrapped_model.set_adapter(specialist_name)
-
-            end_index = start_index + self.k_specialist
-
-            # Slice inputs for the current specialist
-            specialist_indices = slice(start_index, end_index)
-            specialist_advantages = advantages[specialist_indices]
-            specialist_prompt_ids = input["prompt_ids"][specialist_indices]
-            specialist_prompt_mask = input["prompt_mask"][specialist_indices]
-            specialist_completion_ids = input["completion_ids"][specialist_indices]
-            specialist_completion_mask = input["completion_mask"][specialist_indices]
-            specialist_old_per_token_logps = input["old_per_token_logps"][specialist_indices]
-            specialist_ref_per_token_logps = input["ref_per_token_logps"][specialist_indices]
-
-            log_probs_specialist, entropies_specialist = self._get_per_token_logps_and_entropies(
+            log_probs_base, entropies_base = self._get_per_token_logps_and_entropies( # Not sure to use entropies but ... compute first
                 model,
-                specialist_prompt_ids,
-                specialist_prompt_mask,
-                specialist_completion_ids,
-                specialist_completion_mask,
+                inputs["prompt_ids"],
+                inputs["attention_mask"],
+                logits_to_keep=inputs["completion_ids"].size(1)
             )
-            L_Specialist = self._compute_loss(
-                log_probs_specialist,
-                specialist_old_per_token_logps,
-                specialist_ref_per_token_logps,
-                specialist_advantages,
-                specialist_completion_mask,
+
+            L_Base = self._calculate_grpo_loss(
+                log_probs_base,
+                inputs["old_per_token_logps"],
+                inputs["ref_per_token_logps"],
+                advantages, # adv_total
+                completion_mask,
+                entropies_base
             )
-            L_Specialists_total += L_Specialist # Just in case using both specialists
 
-            start_index = end_index
+            # L_Specialists computation
+            L_Specialists_total = 0.0
+            start_index = self.k_base
 
-        # Return total loss
-        L_total_system = L_Base + L_Specialists_total
+            for specialist_name in self.specialist_adapter_list:
+                unwrapped_model.set_adapter(specialist_name)
 
-        # Log metrics as normal '_compute_loss' function does
-        mode = "train" if self.model.training else "eval"
+                end_index = start_index + self.k_specialist
 
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
+                # Slice inputs for the current specialist
+                specialist_indices = slice(start_index, end_index)
 
-        def masked_batch_mean(x):
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                return x.mean()
-            else:
-                return (x * completion_mask).sum() / completion_token_count
+                log_probs_specialist, entropies_specialist = self._get_per_token_logps_and_entropies(
+                    model,
+                    inputs["prompt_ids"][specialist_indices],
+                    inputs["attention_mask"][specialist_indices],
+                    logits_to_keep=inputs["completion_ids"].size(1)
+                )
+                L_Specialist = self._calculate_grpo_loss(
+                    log_probs_specialist,
+                    inputs["old_per_token_logps"][specialist_indices],
+                    inputs["ref_per_token_logps"][specialist_indices],
+                    advantages[specialist_indices], # adv_total for the specialist group
+                    inputs["completion_mask"][specialist_indices],
+                    entropies_specialist
+                )
+                L_Specialists_total += L_Specialist
+                start_index = end_index
 
-        if self.beta != 0.0:
-            mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+            # Return total loss
+            L_total_system = L_Base + L_Specialists_total
 
-        mean_entropy = masked_batch_mean(entropies)
-        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-        # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-
-        low_clip = masked_batch_mean(is_low_clipped.float())
-        high_clip = masked_batch_mean(is_high_clipped.float())
-        clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-        gathered_low_clip = self.accelerator.gather(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-
+        else:
+            raise ValueError(f"Invalid training_mode: {self.training_mode}")
+        
         return L_total_system
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
