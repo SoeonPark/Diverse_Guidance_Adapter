@@ -17,12 +17,14 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict, deque
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Dict, Tuple, Union, Callable, Optional
 
 import datasets
+import pandas as pd
 import torch
 import torch.utils.data
 import transformers
@@ -61,8 +63,8 @@ from trl.models import prepare_deepspeed, prepare_fsdp, prepare_peft_model, unwr
 from trl.models.utils import _ForwardRedirection
 from trl.trainer.base_trainer import BaseTrainer
 from trl.trainer.callbacks import SyncRefModelCallback
-from custom_grpo_config import GRPOConfig
-from trl.trainer.grpo_trainer import GRPOTrainer
+from trl import GRPOConfig, GRPOTrainer
+from custom_dgrpo_config import DGRPOConfig
 from trl.trainer.utils import (
     RepeatSampler,
     disable_dropout_in_model,
@@ -87,7 +89,7 @@ if is_peft_available():
     from peft import PeftConfig, PeftModel
 
 if is_liger_kernel_available():
-    from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+    from liger_kernel.chunked_loss import LigerFusedLinearDGRPOLoss
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
@@ -104,30 +106,17 @@ logger = logging.get_logger(__name__)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
-RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 
-# What we call a rollout function is a callable that takes prompts (list), args (GRPOConfig), and processing_class as
+# What we call a rollout function is a callable that takes prompts (list), args (DGRPOConfig), and processing_class as
 # parameters and returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and
 # "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
 RolloutFunc = Callable[[list[str], Any, Any], dict[str, Any]]
 
-def standardization_func(scores: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    """ Z-Score is often used in Proposed one. """
-    if scores.numel() <= 1:
-        return scores # Unable to standardize a single value
-    
-    mean = torch.mean()
-    std = scores.std()
 
-    # Avoid division by zero
-    if std < epsilon:
-        return torch.zeros_like(scores)
-    
-    return (scores - mean) / (std + epsilon)
-
-class ValSETrainer(GRPOTrainer):
+class DGRPOTrainer(BaseTrainer):
     """
-    Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
+    Trainer for the Group Relative Policy Optimization (DGRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
     Models](https://huggingface.co/papers/2402.03300).
 
@@ -135,7 +124,7 @@ class ValSETrainer(GRPOTrainer):
 
     ```python
     from datasets import load_dataset
-    from trl import GRPOTrainer
+    from trl import DGRPOTrainer
 
     dataset = load_dataset("trl-lib/tldr", split="train")
 
@@ -145,7 +134,7 @@ class ValSETrainer(GRPOTrainer):
         return [float(len(set(completion))) for completion in completions]
 
 
-    trainer = GRPOTrainer(
+    trainer = DGRPOTrainer(
         model="Qwen/Qwen2-0.5B-Instruct",
         reward_funcs=reward_func,
         train_dataset=dataset,
@@ -155,7 +144,7 @@ class ValSETrainer(GRPOTrainer):
     ```
 
     Args:
-        model (`Union[str, PreTrainedModel]`):
+        model (`str | PreTrainedModel`):
             Model to be trained. Can be either:
 
             - A string, being the *model id* of a pretrained model hosted inside a model repo on huggingface.co, or a
@@ -164,7 +153,7 @@ class ValSETrainer(GRPOTrainer):
               using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keyword arguments in
               `args.model_init_kwargs`.
             - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
-        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`):
+        reward_funcs (`RewardFunc | list[RewardFunc]`):
             Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
             functions with the prompts and completions and sum the rewards. Can be either:
 
@@ -188,7 +177,7 @@ class ValSETrainer(GRPOTrainer):
                   reward function's signature.
             - A list of reward functions, where each item can independently be any of the above types. Mixing different
             types within the list (e.g., a string model ID and a custom reward function) is allowed.
-        args ([`GRPOConfig`], *optional*):
+        args ([`DGRPOConfig`], *optional*):
             Configuration for this trainer. If `None`, a default configuration is used.
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
             Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset is
@@ -197,7 +186,7 @@ class ValSETrainer(GRPOTrainer):
             - [Standard](dataset_formats#standard): Each sample contains plain text.
             - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
               and content).
-        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
+        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Dataset | IterableDataset]`):
             Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
         processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.ProcessorMixin`], *optional*):
             Processing class used to process the data. The padding side must be set to "left". If `None`, the
@@ -232,8 +221,8 @@ class ValSETrainer(GRPOTrainer):
             time without prior notice.
     """
 
-    _tag_names = ["trl", "grpo"]
-    _name = "GRPO"
+    _tag_names = ["trl", "dgrpo"]
+    _name = "DGRPO"
     _paper = {
         "title": "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
         "id": "2402.03300",
@@ -250,28 +239,23 @@ class ValSETrainer(GRPOTrainer):
 
     def __init__(
         self,
-        model: Union[str, PreTrainedModel],
-        reward_funcs: Union[RewardFunc, list[RewardFunc]],
-        args: Optional[GRPOConfig] = None,
-        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
-        processing_class: Optional[Union[PreTrainedTokenizerBase, ProcessorMixin]] = None,
-        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
-        callbacks: Optional[list[TrainerCallback]] = None,
-        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
-        peft_config: Optional["PeftConfig"] = None,
-        rollout_func: Optional[RolloutFunc] = None,
-        reward_func_correctness: Callable = None, # A function to compute correctness reward
-        reward_func_similarity: Callable = None, # A function to compute similarity reward (S(C_a, C_b))
-        w_div: float = 0.5, # Weight for diversity reward
-        lambda_div: float = 1.0, # R_Div = -lambda_div * S_max
-        **kwargs,
+        model: str | PreTrainedModel,
+        reward_funcs: RewardFunc | list[RewardFunc],
+        args: DGRPOConfig | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
+        processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+        reward_processing_classes: PreTrainedTokenizerBase | list[PreTrainedTokenizerBase] | None = None,
+        callbacks: list[TrainerCallback] | None = None,
+        optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
+        peft_config: "PeftConfig | None" = None,
+        rollout_func: RolloutFunc | None = None,
     ):
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
-            args = GRPOConfig(f"{model_name}-GRPO")
+            args = DGRPOConfig(f"{model_name}-DGRPO")
 
         # Models
         # Trained model
@@ -286,7 +270,7 @@ class ValSETrainer(GRPOTrainer):
                 model_init_kwargs["dtype"] = dtype
             else:
                 raise ValueError(
-                    "Invalid `dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                    "Invalid `dtype` passed to `DGRPOConfig`. Expected either 'auto' or a string representing "
                     f"a `torch.dtype` (e.g., 'float32'), but got {dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
@@ -297,7 +281,7 @@ class ValSETrainer(GRPOTrainer):
             model_id = get_config_model_id(model.config)
             if args.model_init_kwargs is not None:
                 logger.warning(
-                    "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                    "You passed `model_init_kwargs` to the `DGRPOConfig`, but your model is already instantiated. "
                     "The `model_init_kwargs` will be ignored."
                 )
 
@@ -368,7 +352,9 @@ class ValSETrainer(GRPOTrainer):
                 f"reward functions ({len(reward_funcs)})."
             )
 
-        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+        for i, (reward_processing_class, reward_func) in enumerate(
+            zip(reward_processing_classes, reward_funcs, strict=True)
+        ):
             if isinstance(reward_func, PreTrainedModel):
                 if reward_processing_class is None:
                     reward_processing_class = AutoTokenizer.from_pretrained(get_config_model_id(reward_func.config))
@@ -394,8 +380,8 @@ class ValSETrainer(GRPOTrainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
-        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.max_completion_length = args.max_completion_length  # = |o_i| in the DGRPO paper
+        self.num_generations = args.num_generations  # = G in the DGRPO paper
         self.chat_template_kwargs = args.chat_template_kwargs or {}
         self.temperature = args.temperature
         self.top_p = args.top_p
@@ -437,11 +423,11 @@ class ValSETrainer(GRPOTrainer):
         ):
             # See https://github.com/huggingface/trl/issues/3213
             raise NotImplementedError(
-                "Iterable datasets are not yet supported in GRPOTrainer. Please use a standard dataset instead."
+                "Iterable datasets are not yet supported in DGRPOTrainer. Please use a standard dataset instead."
             )
 
         # Multi-step
-        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
+        self.num_iterations = args.num_iterations  # = 𝜇 in the DGRPO paper
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
@@ -451,7 +437,7 @@ class ValSETrainer(GRPOTrainer):
         self._buffered_inputs = None
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
+        # input tensor associated with the key "input_ids". However, in DGRPO, the sampled data does not include the
         # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
         # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
         # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
@@ -460,9 +446,8 @@ class ValSETrainer(GRPOTrainer):
 
         super().__init__(
             model=model,
-            reward_funcs=[],
             args=args,
-            data_collator=identity,  # No data collation is needed in GRPO
+            data_collator=identity,  # No data collation is needed in DGRPO
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
@@ -474,6 +459,21 @@ class ValSETrainer(GRPOTrainer):
             # simplest (though a bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses
             # that behavior without rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
+        )
+
+        # [Custom]
+        self.num_guidance_adapters = args.num_guidance_adapters
+        self.train_dataset = train_dataset
+        self.diversity_weight = args.diversity_weight if hasattr(args, "diversity_weight") else 1.0 # NEED TO MODIFY
+        self.num_generations_per_diversity_adapters = args.num_generations_per_diversity_adapters
+        self.num_generations_per_base_adapter = args.num_generations_per_base_adapter
+
+        texts = list(self.train_dataset['problem'])
+        self.log_test_inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
         )
 
         # Reference model
@@ -497,11 +497,52 @@ class ValSETrainer(GRPOTrainer):
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
 
-        # [Custom Configurations]
-        self.reward_func_correctness = reward_func_correctness
-        self.reward_func_similarity = reward_func_similarity
-        self.w_div = w_div
-        self.lambda_div = lambda_div
+        # Cast LM Head To FP32
+        if args.cast_lm_head_to_fp32:
+
+            def _cast_lm_head_to_fp32(target_model: PreTrainedModel):
+                """Cast lm_head to fp32 while preserving embedding output dtype if tied."""
+
+                def cast_inputs_to_fp32(module, inputs):
+                    # Preserve other positional args and kwargs untouched
+                    if not inputs:
+                        return inputs
+                    return (inputs[0].to(torch.float32),) + inputs[1:]
+
+                original_dtype_local = target_model.lm_head.weight.dtype
+                target_model.lm_head = target_model.lm_head.float()
+                target_model.lm_head.register_forward_pre_hook(cast_inputs_to_fp32)
+
+                if target_model.config.tie_word_embeddings:
+
+                    def cast_outputs_to_original_dtype(module, args, output):
+                        return output.to(original_dtype_local)
+
+                    # Only cast activations; weights are now fp32 (intentional for numerical stability of logits)
+                    target_model.model.embed_tokens.register_forward_hook(cast_outputs_to_original_dtype)
+
+            _cast_lm_head_to_fp32(model)
+            if self.ref_model is not None:
+                _cast_lm_head_to_fp32(self.ref_model)
+
+        # Liger loss
+        if self.use_liger_kernel:
+            if not is_liger_kernel_available():
+                raise ImportError(
+                    "Liger is required to use `use_liger_kernel` as the DGRPO loss. Run `pip install liger-kernel`."
+                )
+            # redirect the model.module forward to the model forward to ensure pre-forward hooks are called
+            self._forward_redirection = _ForwardRedirection()
+
+            self.liger_dgrpo_loss = LigerFusedLinearDGRPOLoss(
+                beta=self.beta,
+                epsilon_low=self.epsilon_low,
+                epsilon_high=self.epsilon_high,
+                temperature=self.temperature,
+                use_ref_model=self.beta != 0.0,
+                loss_type=self.loss_type,
+                max_completion_length=self.max_completion_length,
+            )
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -648,30 +689,10 @@ class ValSETrainer(GRPOTrainer):
                         reward_func, evaluation_mode=True, device_placement=True
                     )
 
-        # [Custom] Add options for Adapters (Main, Specialist1, Specialist2)
-        self.base_adapter_name = "main"
-        self.training_mode = self.args.training_mode
-        if self.training_mode not in ["originalGRPOMode", "ValSE", "OneAdapterMode"]:
-            raise ValueError(f"Unsupported training_mode: {self.training_mode}")
-        # Also, depends on the training mode, determine to use Parent Class
-        self.specialist_a = self.args.specialists_a
-        self.specialist_b = self.args.specialists_b
-        self.k_base = self.args.num_base_candidates
-        self.k_specialist = self.args.num_specialist_candidates
-        self.k_total = self.k_base + len(self.specialist_names) * self.k_specialist
-        # Debug info
-        print(f" ---- Trainer Settings ---- ")
-        print(f"   >> Training Mode: {self.training_mode}")
-        print(f"   >> Used Adapters: Main + {self.specialist_names} / Total {len(self.specialist_names)+1}")
-        print(f"   >> # Base Candidates: {self.k_base}")
-        print(f"   >> # Specialist Candidates per Specialist: {self.k_specialist}")
-        print(f"   >> # Total Candidates per Prompt: {self.k_total}")
-        print(f" -------------------------- ")
-
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
-        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
+        # In DGRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
             self._signature_columns = ["prompt", "image", "images"]
@@ -684,7 +705,7 @@ class ValSETrainer(GRPOTrainer):
     # `steps_per_generation`. Thus, `_prepare_inputs` is called with this *generation* batch, and it handles the
     # splitting internally.
     # Maintenance note: This method is a copy-paste of the original `Trainer.get_train_dataloader` with only one line
-    # modification. As a result, some parts of the method aren't relevant to GRPO, but we keep them to stay one line
+    # modification. As a result, some parts of the method aren't relevant to DGRPO, but we keep them to stay one line
     # apart from the super method, ensuring easier maintenance in the future.
     def get_train_dataloader(self):
         if self.train_dataset is None:
@@ -716,7 +737,7 @@ class ValSETrainer(GRPOTrainer):
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
-    def _get_train_sampler(self, dataset: Optional[Dataset] = None) -> Sampler:
+    def _get_train_sampler(self, dataset: Dataset | None = None) -> Sampler:
         # Returns a sampler that
         # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
         #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
@@ -858,7 +879,7 @@ class ValSETrainer(GRPOTrainer):
         pixel_attention_mask=None,
         image_sizes=None,
         token_type_ids=None,
-    ) -> dict[str, Optional[torch.Tensor]]:
+    ) -> dict[str, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
@@ -916,7 +937,7 @@ class ValSETrainer(GRPOTrainer):
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         return logps, entropies
 
-    def _fix_param_name_to_vllm(self, name, extra_prefixes: Optional[list[str]] = None):
+    def _fix_param_name_to_vllm(self, name, extra_prefixes: list[str] | None = None):
         extra_prefixes = extra_prefixes or []
         prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
         for prefix in prefixes:
@@ -1040,9 +1061,7 @@ class ValSETrainer(GRPOTrainer):
             self.llm.reset_prefix_cache()
 
     @profiling_decorator
-    def _prepare_inputs(
-        self, generation_batch: dict[str, Union[torch.Tensor, Any]]
-    ) -> dict[str, Union[torch.Tensor, Any]]:
+    def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
         # During training:
         #   - Receives the local generation batch (Per-GPU batch size × steps per generation)
@@ -1061,21 +1080,42 @@ class ValSETrainer(GRPOTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
-                generation_batch = self._generate_and_score_completions(generation_batch)
-                generation_batch = split_pixel_values_by_grid(generation_batch)
-                generation_batch = shuffle_sequence_dict(generation_batch)
-                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                # breakpoint()
+                original_inputs = generation_batch
+                # breakpoint()
+                generation_outputs = self._generate_completions(generation_batch) # list of problem batches
+                # breakpoint()
+                """
+                (Pdb) len(generation_batch)
+                10
+                """
+                scored_batch = self._score_completions(original_inputs, generation_outputs)
+                breakpoint()
+                """
+                (Pdb) len(generation_batch)
+                5
+                (Pdb) generation_batch.keys()
+                dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'sampling_per_token_logps'])
+                """
+                scored_batch = split_pixel_values_by_grid(scored_batch)
+                scored_batch = shuffle_sequence_dict(scored_batch)
+                # breakpoint() # This is the Problem Point -- donot return only int dtype from '_generate_completions' (e.g., 'num_items_in_batch' etc.)
+                generation_batches = split_tensor_dict(scored_batch, self.args.steps_per_generation)
+                # breakpoint()
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
             self._step += 1
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
-            inputs = self._generate_and_score_completions(generation_batch)
+            original_inputs = generation_batch
+            generation_outputs = self._generate_completions(generation_batch)
+            inputs = self._score_completions(original_inputs, generation_outputs)
+
         return inputs
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, current_adapter_name: str = None):
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
@@ -1085,6 +1125,14 @@ class ValSETrainer(GRPOTrainer):
 
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
+
+        breakpoint()
+        if current_adapter_name == "default":
+            self.reward_funcs = [self.reward_funcs[0]] # which is 'correctness' reward
+        else: 
+            self.reward_funcs = self.reward_funcs[0:] # which is "diversity" reward(s)
+
+        breakpoint()
 
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
@@ -1188,9 +1236,8 @@ class ValSETrainer(GRPOTrainer):
                             )
                         else:
                             if is_conversational({"prompt": ordered_set_of_prompts[0]}):
-                                # FIXME: this endpoint doesn't exist in vllm_client
                                 output = self.vllm_client.chat(
-                                    prompts=ordered_set_of_prompts,
+                                    messages=ordered_set_of_prompts,
                                     **sampling_params,
                                     chat_template_kwargs=self.chat_template_kwargs,
                                 )
@@ -1244,7 +1291,7 @@ class ValSETrainer(GRPOTrainer):
                     "max_tokens": self.max_completion_length,
                     "truncate_prompt_tokens": self.max_prompt_length,
                     "guided_decoding": guided_decoding,
-                    "logprobs": 0,  # only return the logprob of the generated token
+                    "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
                 }
                 if self.args.generation_kwargs is not None:
                     generation_kwargs.update(self.args.generation_kwargs)
@@ -1384,8 +1431,8 @@ class ValSETrainer(GRPOTrainer):
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-            prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
-            completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
+            prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool(), strict=True)]
+            completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=True)]
             logprobs = None  # not used in this case
             extra_fields = {}  # No extra fields for non-rollout_func paths
 
@@ -1429,144 +1476,620 @@ class ValSETrainer(GRPOTrainer):
 
         return prompt_ids, completion_ids, total_completion_tokens, logprobs, extra_fields
 
-    def _generate_and_score_completions(
-        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
-    ) -> dict[str, Union[torch.Tensor, Any]]:
-
-        """
-            Seperate these....
-            아아아아
-            지금 생각중인건
-            1. Baseline - 기본 GRPO
-            2. Base + only ONE Specialist 
-            3. Base + Specialist A + Specialist B (Full GRPO)
-            4. Base + Specialist A + Specialist B (But w/o Correctness Gate.. -- which S_valid filters)
-
-
-            -> 3 + Ablation studies
-            근데 암튼 그래도 그러면 mode 설정을 해둬야되는건가.. Specialist는 reward, loss function 둘 다 모두 같은 식으로 적용할거임..
-            아아....
-        """
-
-        z_score = standardization_func
+    def _generate_completions(
+        self, inputs: list[dict[str, torch.Tensor | Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        # breakpoint()
+        device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        # Set up differently depends on Training mode setting
-        if self.training_mode == "originalGRPOMode":
-            print("  >> Running in Standard GRPO Mode (Original) <<  ")
-            return super()._generate_and_score_completions(inputs)
+        # breakpoint()
+        prompts = [x["prompt"] for x in inputs]
+        # breakpoint()
+        all_adapters = ["default"] + [f"guidance_{i}" for i in range(self.num_guidance_adapters)]
+        completion_num_per_adapters = [self.num_generations_per_base_adapter] + [self.num_generations_per_diversity_adapters] * self.num_guidance_adapters
+        all_sampling_logps = []
 
-        # ValSE and OneAdapterMode use the same generation and scoring pipeline, only differ in the adapter setup of number.
-        elif self.training_mode == "ValSE" or self.training_mode == "OneAdapterMode":
-            print("  >> Running in ValSE Mode <<  ")
-            device = self.accelerator.device
-            if self.training_mode == "ValSE":
-                specialist_adapter_list = [self.specialist_a, self.specialist_b]
-            elif self.training_mode == "OneAdapterMode":
-                specialist_adapter_list = [self.specialist_a] # Only use one specialist adapter
+        batch_parts = {
+            "prompt_ids": [], "prompt_mask": [], "completion_ids": [],
+            "completion_mask": [], "advantages": [],
+            "old_per_token_logps": [], "ref_per_token_logps": [],
+        }
 
-            # ==============
-            # [Custom] 
-            # Sampling Phase -> _generate_single_turn
-            C_Base_samples = self._generate_with_adapter(inputs, self.base_adapter_name, self.k_base)
-            C_Sa_samples = self._generate_with_adapter(inputs, self.specialist_a, self.k_specialist)
-            C_Sb_samples = self._generate_with_adapter(inputs, self.specialist_b, self.k_specialist)
+        print(f"  >> [Rollout] Total prompts for input: {len(prompts)}") # Set as 1 for input and Duplicate ~.??..... as num of generations
 
-            # prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-            #     self._generate(prompts)
-            # )
-            prompts, C_total, C_total_ids, batch = self._generate_with_adapter(inputs)
+        # adapter_info = [] # To store which adapter generated which completion 
+        # # (It's Comfort for slicing completions from each adapter, for reward calculation!!!)
 
-            # Compute Correctness rewards for all completions
-            rw_correctness_list = torch.tensor(
-                self.reward_func_correctness(prompts = prompts, completions = C_total, **batch),
-                dtype=torch.float32,
-                device=device,
-            ) # For correctness, total is 10
-            adv_correctness_list = z_score(rw_correctness_list)
+        start_index = 0
+        end_index = 0
 
-            # Compute Diversity rewards -- Advantages are different depends on S_valid filtering
-            rw_diversity_list = torch.tensor(self.k_total, device = device)
-            adv_diversity_list = z_score(rw_diversity_list)
-            rw_diversity_valid_cands = {}
+        for i, (adapter_name, cur_num_generation) in enumerate(zip(all_adapters, completion_num_per_adapters)):
 
-            start_idx = self.k_base
-
-            specialist_groups_texts = {
-                self.specialist_adapter_list[0]: C_total[self.k_base : self.k_base + self.k_specialist],
-                self.specialist_adapter_list[1]: C_total[self.k_base + self.k_specialist : ],
-            }
+            adapter_prompt_ids_list = []
+            adapter_completion_ids_list = []
+            adapter_sampling_logps_list = []
             
-            for specialist_idx, adapter in enumerate(self.specialist_adapter_list):
-                # Compare with base model and the another adapter
-                compare_group = C_total[:self.k_base] + specialist_groups_texts[self.specialist_adapter_list[1 - specialist_idx]]
+            self.model.set_adapter(adapter_name)
+            print(f"  >> [Rollout] Switched to adapter: {adapter_name}")
 
-                for k in range(self.k_specialist):
-                    original_idx = start_idx + k
+            end_index = start_index + cur_num_generation
+            cur_prompts = prompts[start_index:end_index]
 
-                    # For S_valid group (which also considers Correctness)
-                    if self.args.correctness_reward_func_type == "binary": # Set again, if type is binary, it's metrics such as exact_match
-                        if rw_correctness_list[original_idx] == 1:
-                            C_i = C_total[original_idx]
-
-                            # Compute Diversity reward
-                            max_similarity = max([self.reward_func_similarity(C_i, C_j) for C_j in compare_group])
-                            rw_diversity_score = - self.lambda_diversity * max_similarity
-                            rw_diversity_list[original_idx] = rw_diversity_score
-                            rw_diversity_valid_cands[original_idx] = rw_diversity_score
-
-                            # Two cases to compute Diversity reward, adv; one is for S_valid, another is for all from specialists
-                            if self.compare_mode == "s_valid": 
-                                if len(rw_diversity_valid_cands) > 1:
-                                    valid_indices = list(rw_diversity_valid_cands.keys())
-                                    rw_valid_diversity_cands_score = torch.tensor(list(rw_diversity_valid_cands.values()))
-
-                                    adv_valid_diversity_cands_score = z_score(rw_valid_diversity_cands_score)
-                                    adv_diversity_list[valid_indices] = adv_valid_diversity_cands_score
-                            elif self.compare_mode == "all":
-                                pass # already computed above
-                                # 아 아 아 아 다시 ... 다시.....
-                            else:
-                                raise ValueError(f"Invalid compare_mode: {self.compare_mode}")
-                            
-                        else: # Which has incorrect final answer
-                            rw_diversity_score = 0.0 # -> No diversity reward if the correctness is not met
-                            rw_diversity_list[original_idx] = rw_diversity_score
-
-                    elif self.args.correctness_reward_func_type == "continuous": # e.g., F1 score
-                        # Not set yet 
-                        pass # NEED TO MODIFY
-
-                start_idx += self.k_specialist
-
-            adv_total_list = adv_correctness_list + self.w_div * adv_diversity_list
-
-            prompt_ids, prompt_mask, completion_ids, completion_mask, old_per_token_logps, ref_per_token_logps = (
-                self._generate_with_adapter(C_total_ids)
-            )
-
-            return {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "old_per_token_logps": old_per_token_logps,
-                "ref_per_token_logps": ref_per_token_logps,
-                "advantages": adv_total_list,
-                "rewards_correctness": rw_correctness_list,
-                "rewards_diversity": rw_diversity_list,
-            }
-
-    # [Custom] Generate with adapter
-    def _generate_with_adapter(self, inputs: list[dict[str, Union[torch.Tensor, Any]]], adapter_name: str, k: int):
-        # Activate the specified adapter
-        with self.accelerator.unwrap_model(self.model).activate_adapter(adapter_name):
-            prompts = [x["prompt"] for x in inputs]
+            print(f"  >> [Rollout] Generating {cur_num_generation} completions with slice [{start_index}:{end_index}] for adapter - {adapter_name.upper()}")
             prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                self._generate(prompts)
+                self._generate(cur_prompts)
             )
-        return prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields
+            # breakpoint()
+            if extra_fields and isinstance(extra_fields, list):
+                adapter_prompt_ids_list.extend([x["prompt_ids"] for x in extra_fields])
+            elif extra_fields and isinstance(extra_fields, dict):
+                if "prompt_ids" in extra_fields: # It's dictionary field 
+                    adapter_prompt_ids_list.extend(extra_fields["prompt_ids"])
+            else:
+                adapter_prompt_ids_list.extend(prompt_ids_list)
+
+            adapter_completion_ids_list.extend(completion_ids_list)
+
+            print(f"  >> [Rollout] Current Activated Adapter: {adapter_name}")
+            
+            print(f"  >> [Rollout] Total generated: {len(adapter_completion_ids_list)} completions")
+            
+            completion_ids_tensor = [torch.tensor(ids, device=device) for ids in adapter_completion_ids_list]
+            completions_text = self.processing_class.batch_decode(completion_ids_tensor, skip_special_tokens=True)
+            # breakpoint()
+            
+            print(f"\n{'='*50}")
+            print(f"[{adapter_name}] Generated {len(completions_text)} completions:")
+            for j, text in enumerate(completions_text):
+                print(f"  [{adapter_name}-{j}]: {text[:100]}...") 
+            print(f"{'='*50}\n")
+            
+            prompt_ids = [torch.tensor(ids, device=device) for ids in adapter_prompt_ids_list]
+            prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+            prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
+            prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+
+            completion_ids = [torch.tensor(ids, device=device) for ids in adapter_completion_ids_list]
+            completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+            completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+            
+            if sampling_per_token_logps_list is not None:
+                adapter_sampling_logps_list.extend(sampling_per_token_logps_list)
+                sampling_per_token_logps = [torch.tensor(logps, device = device) for logps in adapter_sampling_logps_list]
+                sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
+                all_sampling_logps.append(sampling_per_token_logps)
+            else:
+                sampling_per_token_logps = None
+            
+            batch_parts["prompt_ids"].append(prompt_ids)
+            batch_parts["prompt_mask"].append(prompt_mask)
+            batch_parts["completion_ids"].append(completion_ids)
+            batch_parts["completion_mask"].append(completion_mask)
+
+            start_index = end_index
+
+        # Concatenate all adapters' generations
+        prompt_ids = torch.cat(batch_parts["prompt_ids"], dim=0)
+        prompt_mask = torch.cat(batch_parts["prompt_mask"], dim=0)
+        completion_ids = torch.cat(batch_parts["completion_ids"], dim=0)
+        completion_mask = torch.cat(batch_parts["completion_mask"], dim=0)
+        # breakpoint()
+        """
+        (Pdb) prompt_ids.shape
+        torch.Size([10, 93])
+        (Pdb) completion_ids.shape
+        torch.Size([10, 256])
+        """
+
+        if all_sampling_logps:
+            sampling_per_token_logps = torch.cat(all_sampling_logps, dim=0)
+        else:
+            sampling_per_token_logps = None
+
+        print(f"  >> [Rollout] Completed generation for all adapters: Total {completion_ids.size(0)} Completions\n")
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "sampling_per_token_logps": sampling_per_token_logps,
+            # "num_items_in_batch": len(prompts),
+            **extra_fields,
+        }
+
     
+    def _score_completions(
+            self, inputs: list[dict[str, torch.Tensor | Any]],
+            generation_outputs: dict[str, torch.Tensor | Any] # Output from '_generate_completions'
+    ) -> dict[str, torch.Tensor | Any]:
+        # breakpoint()
+        """
+        (Pdb) inputs.shape
+        *** AttributeError: 'list' object has no attribute 'shape'       
+        (Pdb) len(inputs)
+        10
+        """
+        
+        """
+            Scores the generated completions using the current model and reference model,
+            Things to Follow:c
+                * Rewards are Differ with adapter used for Generation
+                    - Default Adapter: Only compute rewards for *Correctness* -> Compute for all Completions (K=10)
+                    - Guidance Adapters: Compute rewards for *Diversity* -> Compute for K completions generated from each Guidance Adapter
+                * So, during scoring, we need to know which adapter generated which completion
+
+            ---
+                균엽님의 조언:
+                    * Since the Range to compute rewards is different, it would be easy to initialize different inputs
+                        - For Default Adapter: Prepare input for all completions (K=10)
+                        - For Guidance Adapters: Prepare input with slicing for K completions
+                            e.g., For the 'Guidance_1', pre-prepare inputs from 4:7th completions only 
+                                처음부터... inputs를 나눠서 넣어주는게 편할 것 같다는 의견....
+                                아니 그렇네 그니까 reward 계산할 때 Input도 들어가야되니까, 처음부터 
+                                 - base_adapter에 대한 reward 계산 시, 전체 completions에 대한 inputs를 넣어줌(10개 다 같은 Input?)
+                                 - guidance_adapter에 대한 reward 계산 시, 해당 adapter가 생성한 completions에 대한 inputs만 넣어줌(4~7번째)
+        """
+
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        prompts = [x["prompt"] for x in inputs]
+
+        prompt_ids = generation_outputs["prompt_ids"]
+        prompt_mask = generation_outputs["prompt_mask"]
+        completion_ids = generation_outputs["completion_ids"]
+        completion_mask = generation_outputs["completion_mask"]
+        sampling_per_token_logps = generation_outputs.get("sampling_per_token_logps", None)
+        extra_fields = {k: v for k, v in generation_outputs.items() 
+                        if k not in ["prompt_ids", "prompt_mask", "completion_ids", 
+                                     "completion_mask", "sampling_per_token_logps"]}
+
+        num_items_in_batch = len(prompts)
+        total_num_completions = completion_ids.size(0)
+        # breakpoint() # Check if completion_ids.size(0) == len(prompts) -> OK
+        """
+        (Pdb) total_num_completions
+        10
+        (Pdb) self.num_generations_per_base_adapter
+        4
+        (Pdb) self.num_generations_per_diversity_adapters
+        3
+        (Pdb) self.num_guidance_adapters
+        2
+        (Pdb) completion_ids.shape
+        torch.Size([10, 256])
+        (Pdb) prompt_ids.shape
+        torch.Size([10, 93])
+        """
+
+        all_adapters = ["default"] + [f"guidance_{i}" for i in range(self.num_guidance_adapters)]
+
+        completion_ids_list = completion_ids.tolist()  
+
+        forward_kwargs = {}
+        num_images = None        
+
+        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+        if self.mask_truncated_completions:
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+        # If token_type_ids are used, extend them with zeros for the completion part
+        if "token_type_ids" in forward_kwargs:
+            token_type_ids = forward_kwargs["token_type_ids"]
+            forward_kwargs["token_type_ids"] = torch.cat(
+                [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
+            )
+
+        old_logits_batch = {}
+        ref_logits_batch = {}
+
+        for adapter_index in range(len(all_adapters)):
+            print(f"  >> [Rollout] Computing logits for adapter: {adapter_index} / {all_adapters[adapter_index]}")
+            self.model.set_adapter(all_adapters[adapter_index])
+            with torch.no_grad():
+                # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
+                # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
+                # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
+                # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
+                # old_per_token_logps to None.
+                # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
+                # distribution mismatch between vLLM and the training model can be large and harm the training.
+
+                # self.model.set_adapter("default")  # switch to default adapter for reference model scoring
+
+                generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+                if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                    self.use_vllm and self.vllm_importance_sampling_correction
+                ):
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+                else:
+                    old_per_token_logps = None
+                breakpoint()
+
+                # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
+                if self.use_vllm and self.vllm_importance_sampling_correction:
+                    importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
+                    importance_sampling_ratio = torch.clamp(
+                        importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                    )
+                old_logits_batch[adapter_index] = old_per_token_logps
+                breakpoint()
+                self.model.set_adapter(all_adapters[0])  # switch to default adapter for reference model scoring
+
+            # Compute the per-token log probabilities for the reference model
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            batch_size=batch_size,
+                            num_images=num_images,
+                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                        )
+            else:
+                ref_per_token_logps = None
+
+            ref_logits_batch[adapter_index] = ref_per_token_logps # All same for each adapter
+
+        # Decode
+        prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        print(f"  >> [Scoring Rollout] Decoded completions for reward calculation. | {len(prompts_text)} : {len(completions_text)}")
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text, strict=True):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        # Merge extra_fields from rollout_func into inputs for reward functions
+        if extra_fields:
+            for i, inp in enumerate(inputs):
+                for key, values in extra_fields.items():
+                    if isinstance(values, list) and i < len(values):
+                        inp[key] = values[i]
+                    elif not isinstance(values, list):
+                        inp[key] = values
+
+        # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
+        # important because rewards will be normalized per group, and completions are distributed. We will later slice
+        # rewards_per_func to extract each process's subset.
+        start_index = 0
+        end_index = 0
+        all_rewards_list = [] # Store rewards from all adapters
+
+        for adapter_index, adapter_name in enumerate(all_adapters):
+            if adapter_name == "default":
+                cur_num_generation = self.num_generations_per_base_adapter
+                print(f"  >> [Reward Rollout] Processing with {adapter_name} | Completions to Process: {cur_num_generation} per input (CORRECTNESS)")
+            elif adapter_name.startswith("guidance_"):
+                cur_num_generation = self.num_generations_per_diversity_adapters
+                print(f"  >> [Reward Rollout] Processing with {adapter_name} | Completions to Process: {cur_num_generation} per input (DIVERSITY)")
+
+            # Calculate the Range of Completions to process for the current adapter
+            # For each original input, this adapter generated 'cur_num_generation' completions
+            # total_completions_for_adapter = num_items_in_batch # * cur_num_generation
+            end_index = start_index + cur_num_generation
+
+            print(f"  >> [Reward Rollout] Calculating rewards for completions slice [{start_index}:{end_index}] from adapter - {adapter_name.upper()}")
+            print(f"        - Total Completions to Score: {cur_num_generation} | For {num_items_in_batch} inputs")
+
+            # Slice completions and their corresponding inputs for the current adapter
+            adapter_completions = completions[start_index:end_index]
+            adapter_completion_ids_list = completion_ids_list[start_index:end_index]
+            print(f"        - Sliced {len(adapter_completions)} completions for reward calculation.")
+
+            # breakpoint()
+
+            if adapter_name == "default":
+                """
+                    For Default Adapter:
+                        It's for 'Correctness' Reward Calculation -> Calcualte for all completions (K=10)
+                        Don't need to expand inputs here, but need to prepare all generated completions from all adapters to calculate rewards.
+                """
+                completion_list_to_calculate = []
+
+                for i in range(num_items_in_batch):
+                    # inputs.append(inputs[i])  # Repeat inputs for all completions
+                    # prompts.append(prompts[i])
+                    completion_list_to_calculate.append(completions[i])
+
+                # breakpoint()
+                default_adapter_rewards = self._calculate_rewards(
+                    inputs,
+                    prompts,
+                    completion_list_to_calculate,
+                    completion_ids_list,
+                    current_adapter_name=adapter_name
+                )
+                all_rewards_list.append(default_adapter_rewards)
+                # [Todo]
+                # -> From here, we can check if the final answer is correct or not for each completion
+                # if 'self.args.consider_correctness_in_diversity' is True:
+                # -> By checking and getting know the positions of incorrect completions, 
+                #    Apply 0 reward for diversity reward from Guidance Adapters (Whatever the Diversity reward is...)
+
+            elif adapter_name.startswith("guidance_"):
+                """
+                    For Guidance Adapters:
+                        WE NEED TO COMPARE THE GENERATED COMPLETIONS WITH EACH OTHER FROM THE OTHER ADAPTERS
+                        여기서 config에 저장해둔 sim 측정 방식을 따라서 각 completion과 다른 completion들 간의 유사도를 측정하고 그의 max값을 reward로 
+                        이후에 가령 num_generations_per_diversity_adapters가 3이라면, 3개의 reward를 저장하고 그에 대한 평균 빼고 정규화하는걸로 Advantage를 매겨야됐음......
+                """
+                adapter_index = int(adapter_name.split("_")[1]) # e.g., guidance_1 -> 1
+
+                # Range of completions generated by this guidance adapter (current adapter)
+                current_start = start_index
+                current_end = end_index
+
+                adapter_rewards_list = []
+
+                for k in range(cur_num_generation):
+                    completion_index = current_start + k
+                    current_completion = completions[completion_index]
+                    current_input = inputs[completion_index]
+                    current_prompt = prompts[completion_index]
+                    current_completion_id = completion_ids_list[completion_index]
+
+                    # Prepare comparison completions from other adapters
+                    comparison_completions = []
+                    comparison_inputs = []
+                    comparison_prompts = []
+                    completion_ids_for_comparison = []
+
+                    # Collect completions from Base adapter
+                    for base_index in range(self.num_generations_per_base_adapter):
+                        comparison_completions.append(completions[base_index])
+                        comparison_inputs.append(inputs[base_index])
+                        comparison_prompts.append(prompts[base_index])
+                        completion_ids_for_comparison.append(completion_ids_list[base_index])
+
+                    # Collect completions from other Guidance adapters
+                    for other_adapter_index in range(self.num_guidance_adapters):
+                        if other_adapter_index == adapter_index:
+                            continue  # Skip current adapter
+                        other_start = self.num_generations_per_base_adapter + (other_adapter_index * self.num_generations_per_diversity_adapters)
+                        other_end = other_start + self.num_generations_per_diversity_adapters
+
+                        for other_k in range(self.num_generations_per_diversity_adapters):
+                            other_index = other_start + other_k
+                            comparison_completions.append(completions[other_index])
+                            comparison_inputs.append(inputs[other_index])
+                            comparison_prompts.append(prompts[other_index])
+                            completion_ids_for_comparison.append(completion_ids_list[other_index])
+
+                    all_completions_for_reward = [current_completion] + comparison_completions
+                    all_inputs_for_reward = [current_input] + comparison_inputs
+                    all_prompts_for_reward = [current_prompt] + comparison_prompts
+                    all_completion_ids_for_reward = [current_completion_id] + completion_ids_for_comparison
+
+                    # Calculate rewards for Diversity
+                    # Format: [current_completion] + [comparison_completions from other adapters]
+                    single_completion_reward = self._calculate_rewards(
+                        all_inputs_for_reward,
+                        all_prompts_for_reward,
+                        all_completions_for_reward,
+                        all_completion_ids_for_reward,
+                        current_adapter_name=adapter_name,
+                    )
+
+                    adapter_rewards_list.append(single_completion_reward[0])
+
+                adapter_rewards = torch.stack(adapter_rewards_list, dim=0)
+                all_rewards_list.append(adapter_rewards)
+
+                print(f"        - Reward Statistics for {adapter_name}: Mean={adapter_rewards.mean().item():.4f}, Std={adapter_rewards.std().item():.4f}, Min={adapter_rewards.min().item():.4f}, Max={adapter_rewards.max().item():.4f}")
+            else: 
+                raise ValueError(f"Unknown adapter name: {adapter_name}")
+            
+            # breakpoint()
+
+            print(f"  >> [Reward Rollout] Completed to Calculate rewards from all Adapters | Len of each reward inputs: {len(inputs)}")
+
+            print(f"  >> [Reward Rollout] Computed Rewards Shape: {len(all_rewards_list)}")
+            # breakpoint()
+            """
+            (Pdb) len(all_rewards_list)
+            3
+            """
+
+            start_index = end_index
+
+        rewards_per_func = torch.cat(all_rewards_list, dim=0)  # Concatenate rewards from all adapters
+        breakpoint()
+        print(f"  >> [Reward Rollout] Final rewards_per_func Shape: {rewards_per_func.shape}")
+
+        breakpoint()
+
+        # Compute grouped-wise rewards
+        rewards = rewards_per_func.sum(dim=1)
+        breakpoint()
+
+        advantages_list = []
+        # Normalize the rewards to compute the advantages
+        mean_gr_default = rewards[:self.num_generations].view(-1, self.num_generations).mean(dim=1)
+        mean_gr_default = mean_gr_default.repeat_interleave(self.num_generations, dim=0)
+        advantages_correctness = rewards[:self.num_generations] - mean_gr_default
+
+        advantages_list.append(advantages_correctness)
+        breakpoint()
+
+        for i in range(1, self.num_guidance_adapters + 1):
+
+            start_index = self.num_generations_per_base_adapter + ((i - 1) * self.num_generations_per_diversity_adapters)
+            end_index = start_index + self.num_generations_per_diversity_adapters
+            
+            mean_gr_diversity = rewards[start_index:end_index].view(-1, self.num_generations_per_diversity_adapters).mean(dim=1)
+            # breakpoint() 
+            mean_gr_diversity = mean_gr_diversity.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
+            breakpoint() 
+            advantages_diversity = rewards[start_index:end_index] - mean_gr_diversity
+            breakpoint()
+            advantages_list.append(advantages_diversity)
+            breakpoint()
+
+        # Concatenate all advantages as a single tensor
+        # total_advantages[:self.num_generations] -> advantages_correctness
+        # total_advantages[self.num_generations:self.num_generations_per_diversity_adapters] -> advantages_diversity ... so on
+        start_index = 0
+        end_index = 0
+        total_advantages = torch.cat(advantages_list, dim=0)
+        # Slice Correctness and Diversity advantages separately
+        # Correctness advantages
+        correctness_advantages = total_advantages[:self.num_generations]
+        # Diversity advantages
+        for i in range(1, self.num_guidance_adapters + 1):
+            start_index = self.num_generations_per_base_adapter + ((i - 1) * self.num_generations_per_diversity_adapters)
+            end_index = start_index + self.num_generations_per_diversity_adapters
+            diversity_advantages = total_advantages[start_index:end_index]
+            
+
+        breakpoint()
+
+
+        if self.scale_rewards in ["group", "none"]:
+            # If self.scale_rewards = "none", we'll still log group level std
+            if adapter_name == "default":
+                std_rewards = rewards[:self.num_generations].view(-1, self.num_generations).std(dim=1)
+                std_rewards = std_rewards.repeat_interleave(self.num_generations, dim=0)
+            elif adapter_name.startswith("guidance_"):
+                std_rewards = rewards[start_index:end_index].view(-1, self.num_generations_per_diversity_adapters).std(dim=1)
+                std_rewards = std_rewards.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
+            else: 
+                raise ValueError(f"Unknown adapter name: {adapter_name}")
+        elif self.scale_rewards == "batch":
+            # Compute global std
+            std_rewards = rewards.std().expand_as(rewards)
+        else:
+            raise ValueError(
+                f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
+            )
+
+        is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+        if self.scale_rewards != "none":
+            advantages_correctness = advantages_correctness / (std_rewards + 1e-4)
+            # If self.num_guidance_adapters > 1: # Need to normalize diversity advantages separately
+            advantages_diversity = advantages_diversity / (std_rewards + 1e-4)  
+
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        all_process_advantages = advantages_correctness.clone()  # keep the aggregated advantages for logging
+        advantages_correctness = advantages_correctness[process_slice]
+
+        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+        self._metrics[mode]["reward"].append(mean_gr_default.mean().item())
+        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # Log prompt and completion texts
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        for i, name in enumerate(self.reward_func_names):
+            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+        self._logs["advantages"].extend(all_process_advantages.tolist())
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+            delta = delta[completion_mask.bool()]
+            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                self.accelerator.gather(mean_delta).mean().item()
+            )
+            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                self.accelerator.gather(max_delta).max().item()
+            )
+
+            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
+            min_importance_sampling_ratio = (
+                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            mean_importance_sampling_ratio = (
+                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            max_importance_sampling_ratio = (
+                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+            )
+        
+        output = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages_list,
+            # "advantages_diversity": advantages_diversity,  # Placeholder for diversity advantages
+            "num_items_in_batch": num_items_in_batch,
+        }
+        if old_per_token_logps is not None:
+            output["old_per_token_logps"] = old_per_token_logps
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            output["importance_sampling_ratio"] = importance_sampling_ratio
+        if ref_per_token_logps is not None:
+            output["ref_per_token_logps"] = ref_per_token_logps
+        if "pixel_values" in forward_kwargs:
+            output["pixel_values"] = forward_kwargs["pixel_values"]
+        if "image_grid_thw" in forward_kwargs:
+            output["image_grid_thw"] = forward_kwargs["image_grid_thw"]
+        if "pixel_attention_mask" in forward_kwargs:
+            output["pixel_attention_mask"] = forward_kwargs["pixel_attention_mask"]
+        if "image_sizes" in forward_kwargs:
+            output["image_sizes"] = forward_kwargs["image_sizes"]
+        if "token_type_ids" in forward_kwargs:
+            output["token_type_ids"] = forward_kwargs["token_type_ids"]
+
+        return output
+
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -1587,8 +2110,8 @@ class ValSETrainer(GRPOTrainer):
             inputs.get("image_sizes"),
         )
 
-        # compute loss and metrics using liger grpo loss
-        loss, metrics = self.liger_grpo_loss(
+        # compute loss and metrics using liger dgrpo loss
+        loss, metrics = self.liger_dgrpo_loss(
             _input=last_hidden_state,
             lin_weight=unwrapped_model.lm_head.weight,
             selected_token_ids=completion_ids,
@@ -1598,7 +2121,7 @@ class ValSETrainer(GRPOTrainer):
             old_per_token_logps=inputs.get("old_per_token_logps"),
             ref_per_token_logps=inputs.get("ref_per_token_logps"),
         )
-        # Extract metrics from the liger_grpo_loss output
+        # Extract metrics from the liger_dgrpo_loss output
         # KL divergence is the first metric when beta is non-zero
         mean_kl = metrics[0] if self.beta != 0.0 else None
         clip_ratio = metrics[-1]
@@ -1612,28 +2135,64 @@ class ValSETrainer(GRPOTrainer):
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
+            raise ValueError("The DGRPOTrainer does not support returning outputs")
         if self.use_liger_kernel:
-            # Compute the loss using the liger grpo loss
+            # Compute the loss using the liger dgrpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
+        elif self.args.use_original_grpo_loss:
+            return self._compute_loss_grpo_original(model, inputs)
         else:
             return self._compute_loss(model, inputs)
+        
+    # [Custom]
+    def _compute_grpo_loss(self, model, inputs):
+        """ This is the original compute_loss from GRPOTrainer """
+        # Compute the per-token log probabilities for the model
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-    def _calculate_grpo_loss (
-            self,
-            per_token_logps: torch.Tensor,
-            old_per_token_logps: torch.Tensor,
-            ref_per_token_logps: torch.Tensor,
-            advantages: torch.Tensor,
-            completion_mask: torch.Tensor,
-            entropies: torch.Tensor,
-            adapter_name: str = None,
-        ):
-        # Uses the original GRPO loss computation from the base class
+        # Compute the per_token_logps and the entropy at each position in the completion
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            compute_entropy=True,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            num_images=inputs.get("num_images"),
+            pixel_attention_mask=inputs.get("pixel_attention_mask"),
+            image_sizes=inputs.get("image_sizes"),
+            token_type_ids=inputs.get("token_type_ids"),
+        )
+
+        if self.top_entropy_quantile < 1.0:
+            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
+        else:
+            entropy_mask = None
+
+        # Compute the KL divergence between the model and the reference model
+        if self.beta != 0.0:
+            ref_per_token_logps = inputs["ref_per_token_logps"]
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
+
+        # Compute the loss
+        advantages = inputs["advantages"]
+        # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
+        # old_per_token_logps == per_token_logps. In this case we can skip its computation
+        # (see _generate_completions) and instead use per_token_logps.detach().
+        # The exception is when using vLLM, where we always compute old_per_token_logps
+        # for importance sampling
+        old_per_token_logps = inputs.get("old_per_token_logps")
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-        log_ratio = per_token_logps - old_per_token_logps
 
+        log_ratio = per_token_logps - old_per_token_logps
         if self.importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == "sequence":
@@ -1657,15 +2216,6 @@ class ValSETrainer(GRPOTrainer):
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = self.get_high_entropy_mask(
-                entropies, adapter_name=adapter_name, quantile=self.top_entropy_quantile
-            )
-        else:
-            entropy_mask = None
-
-
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
@@ -1673,127 +2223,15 @@ class ValSETrainer(GRPOTrainer):
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        if self.loss_type == "grpo":
+        if self.loss_type == "dgrpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
             loss = loss / self.current_gradient_accumulation_steps
         elif self.loss_type == "bnpo":
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
             loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dapo":
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        # Log the metrics
-        mode = "train" if self.model.training else "eval"
-
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
-
-        def masked_batch_mean(x):
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                return x.mean()
-            else:
-                return (x * completion_mask).sum() / completion_token_count
-
-        if self.beta != 0.0:
-            mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
-
-        mean_entropy = masked_batch_mean(entropies)
-        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-        # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-
-        low_clip = masked_batch_mean(is_low_clipped.float())
-        high_clip = masked_batch_mean(is_high_clipped.float())
-        clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-        gathered_low_clip = self.accelerator.gather(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-
-    def _calculate_grpo_loss (
-            self,
-            per_token_logps: torch.Tensor,
-            old_per_token_logps: torch.Tensor,
-            ref_per_token_logps: torch.Tensor,
-            advantages: torch.Tensor,
-            completion_mask: torch.Tensor,
-            entropies: torch.Tensor,
-            adapter_name: str = None,
-        ):
-        # Uses the original GRPO loss computation from the base class
-        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-        log_ratio = per_token_logps - old_per_token_logps
-
-        if self.importance_sampling_level == "token":
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level == "sequence":
-            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
-            )
-        # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
-
-        coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-
-        # Two-sided clipping
-        if self.args.delta is not None:
-            coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = self.get_high_entropy_mask(
-                entropies, adapter_name=adapter_name, quantile=self.top_entropy_quantile
-            )
-        else:
-            entropy_mask = None
-
-
-        if entropy_mask is not None:
-            per_token_loss = per_token_loss * entropy_mask
-
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
-
-        if self.beta != 0.0:
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
+        elif self.loss_type == "dr_dgrpo":
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
             loss = loss / self.current_gradient_accumulation_steps
         elif self.loss_type == "dapo":
@@ -1839,86 +2277,84 @@ class ValSETrainer(GRPOTrainer):
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 
-        return loss
-
-    def _compute_loss(self, model, inputs, return_outputs=False): # Overwrite the original _compute_loss
+    # Appliable for Adapter settings
+    def _compute_loss(
+            self,
+            model: torch.nn.Module,
+            inputs: Dict[str, Union[torch.Tensor, Any]],
+            return_outputs: bool = False,
+            num_items_in_batch: int | None = None,
+            ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         
-        """
-            For Computing cases with multi-adapters
+        total_loss = 0.0
 
-            * L_Base: Compute log_probs for all completions (k=10)
-            * L_Specialists: Compute log_probs for only the specialist completions (k=3 for each)
-            * L_Total = L_Base + L_Specialists_{}
-        """
-        if self.training_mode == "originalGRPOMode":
-            print("  >> Computing Loss as Standard GRPO Mode (Original) <<  ")
-            return super()._compute_loss(model, inputs, return_outputs)
-        
-        elif self.training_mode == "ValSE" or self.training_mode == "OneAdapterMode":
-            print("  >> Computing Loss with new proposing one, ValSE Mode <<  ")       
 
-            # Get adv_totals from '_generate_and_score_completions'
-            advantages = inputs["advantages"] # (K = 10)
-            completion_mask = inputs["completion_mask"]
-            unwrapped_model = self.accelerator.unwrap_model(model)
+        # Extract Shared Inputs
+        all_adapters = inputs["all_adapters"] # List of all adapter names used in this batch
+        advantages_list = inputs["advantages"]  # List of advantages tensors for each adapter
+        old_logits_batch = inputs["old_logits_batch"]  # Dict to store old logits per adapter
+        ref_logits_batch = inputs["ref_logits_batch"]  # Dict to store ref logits per
 
-            # L_Base computation (Distill Loss)
-            unwrapped_model.set_adapter(self.base_adapter_name)
+        prompt_ids = inputs["prompt_ids"]
+        prompt_mask = inputs["prompt_mask"]
+        completion_ids = inputs["completion_ids"]
+        completion_mask = inputs["completion_mask"]
 
-            log_probs_base, entropies_base = self._get_per_token_logps_and_entropies( # Not sure to use entropies but ... compute first
-                model,
-                inputs["prompt_ids"],
-                inputs["attention_mask"],
-                logits_to_keep=inputs["completion_ids"].size(1)
-            )
+        # Process each adapter separately
+        for adapter_index, adapter_name in enumerate(all_adapters):
+            print(f"  >> [Loss Computation] Processing Adapter: {adapter_name.upper()}")
+            # Set the model to use the current adapter
+            model.set_adapter(adapter_name)
 
-            L_Base = self._calculate_grpo_loss(
-                log_probs_base,
-                inputs["old_per_token_logps"],
-                inputs["ref_per_token_logps"],
-                advantages, # adv_total
-                completion_mask,
-                entropies_base
-            )
+            # Determine the slice indices for this adapter's completions
+            if adapter_name == "default":
+                start_index = 0
+                end_index = self.num_generations_per_base_adapter
+            else:
+                guidance_index = int(adapter_name.split("_")[1]) # e.g., guidance_1 -> 1
+                start_index = self.num_generations_per_base_adapter + (guidance_index * self.num_generations_per_diversity_adapters)
+                end_index = start_index + self.num_generations_per_diversity_adapters
+            print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
 
-            # L_Specialists computation
-            L_Specialists_total = 0.0
-            start_index = self.k_base
+            # Slice inputs for the current adapter
+            adapter_prompt_ids = prompt_ids[start_index:end_index]
+            adapter_prompt_mask = prompt_mask[start_index:end_index]
+            adapter_completion_ids = completion_ids[start_index:end_index]
+            adapter_completion_mask = completion_mask[start_index:end_index]
+            adapter_advantages = advantages_list[adapter_index]
 
-            for specialist_name in self.specialist_adapter_list:
-                unwrapped_model.set_adapter(specialist_name)
+            # Prepare adapter-specific inputs
+            adapter_inputs = {
+                "prompt_ids": adapter_prompt_ids,
+                "prompt_mask": adapter_prompt_mask,
+                "completion_ids": adapter_completion_ids,
+                "completion_mask": adapter_completion_mask,
+                "advantages": adapter_advantages,
+                "old_per_token_logps": old_logits_batch[adapter_name][start_index:end_index] if old_logits_batch[adapter_name] is not None else None,
+                "ref_per_token_logps": ref_logits_batch[adapter_name][start_index:end_index] if ref_logits_batch[adapter_name] is not None else None,
+                "num_items_in_batch": num_items_in_batch,
+            }
 
-                end_index = start_index + self.k_specialist
+            # Vision related ones but not used in mine
+            if "pixel_values" in inputs:
+                adapter_inputs["pixel_values"] = inputs["pixel_values"][start_index:end_index]
+            if "image_grid_thw" in inputs:
+                adapter_inputs["image_grid_thw"] = inputs["image_grid_thw"][start_index:end_index]
+            if "num_images" in inputs:
+                adapter_inputs["num_images"] = inputs["num_images"][start_index:end_index]
+            if "importance_sampling_ratio" in inputs:
+                adapter_inputs["importance_sampling_ratio"] = inputs["importance_sampling_ratio"][start_index:end_index]
 
-                # Slice inputs for the current specialist
-                specialist_indices = slice(start_index, end_index)
+            # Compute loss for the current adapter
+            adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
 
-                log_probs_specialist, entropies_specialist = self._get_per_token_logps_and_entropies(
-                    model,
-                    inputs["prompt_ids"][specialist_indices],
-                    inputs["attention_mask"][specialist_indices],
-                    logits_to_keep=inputs["completion_ids"].size(1)
-                )
-                L_Specialist = self._calculate_grpo_loss(
-                    log_probs_specialist,
-                    inputs["old_per_token_logps"][specialist_indices],
-                    inputs["ref_per_token_logps"][specialist_indices],
-                    advantages[specialist_indices], # adv_total for the specialist group
-                    inputs["completion_mask"][specialist_indices],
-                    entropies_specialist
-                )
-                L_Specialists_total += L_Specialist
-                start_index = end_index
+            total_loss += adapter_loss
 
-            # Return total loss
-            L_total_system = L_Base + L_Specialists_total
+            print(f"        - Adapter {adapter_name.upper()} Loss: {adapter_loss.item():.4f}")
 
-        else:
-            raise ValueError(f"Invalid training_mode: {self.training_mode}")
-        
-        return L_total_system
+        return total_loss
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -1926,7 +2362,7 @@ class ValSETrainer(GRPOTrainer):
             loss = loss.mean().detach()
         return loss, None, None
 
-    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -1939,6 +2375,44 @@ class ValSETrainer(GRPOTrainer):
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
+        # [Custom]
+        print("\n ==== Trainer Log Step; For Running Adapter Logits Check =====")
+
+        device = self.accelerator.device
+        test_inputs = self.log_test_inputs.to(device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        logits_states = {}
+
+        adapter_name = "default"
+        model.set_adapter(adapter_name)
+        with torch.no_grad():
+            outputs = model(**test_inputs, output_hidden_states=True, return_dict=True)
+            logits_states[f"adapter_{adapter_name}"] = outputs.logits
+            # Collect hidden states from all layers
+            print(f"  >> Logits from Default Adapter: {outputs.logits}")
+            print(f"  >> Mean Logits from Default Adapter: {outputs.logits.mean().item()}")
+        print(model.active_adapter)
+        # model.reset_adapter()
+
+        for i in range(self.num_guidance_adapters):
+            adapter_name = f"guidance_{i}"
+            model.set_adapter(adapter_name)
+            print(model.active_adapter)
+
+            with torch.no_grad():
+                outputs = model(**test_inputs, output_hidden_states=True, return_dict=True)
+                logits_states[f"adapter_{adapter_name}"] = outputs.logits
+                # Collect hidden states from all layers
+                for layer_idx, hidden_state in enumerate(outputs.hidden_states):
+                    logits_states[f"adapter_{adapter_name}_layer_{layer_idx}_hidden_state"] = hidden_state
+                print(f"  >> Logits from Adapter {adapter_name}: {outputs.logits}")
+                print(f"  >> Mean Logits from Adapter {adapter_name}: {outputs.logits.mean().item()}")
+            print(model.active_adapter)
+
+        model.set_adapter("default")  # Reset to default adapter after logging
+        print(model.active_adapter)
+        
         if self.accelerator.is_main_process and self.log_completions:
             if is_rich_available():
                 print_prompt_completions_sample(
@@ -1950,45 +2424,45 @@ class ValSETrainer(GRPOTrainer):
                     self.num_completions_to_print,
                 )
 
-            logging_backends = []
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                logging_backends.append(wandb)
-            if self.args.report_to and "trackio" in self.args.report_to:
-                logging_backends.append(trackio)
+            table = {
+                "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
+                "prompt": self._logs["prompt"],
+                "completion": self._logs["completion"],
+                **self._logs["rewards"],
+                "advantage": self._logs["advantages"],
+            }
 
-            if logging_backends:
-                import pandas as pd
+            df_base = pd.DataFrame(table)
+            images_raw = self._logs["images"] or []
 
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
-                    "prompt": self._logs["prompt"],
-                    "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
-                }
-
-                df_base = pd.DataFrame(table)
-                images_raw = self._logs["images"] or []
-
-                for logging_backend in logging_backends:
+            for logging_backend in self.args.report_to:
+                if logging_backend == "wandb":
                     if images_raw:
-                        # Convert images per backend and derive a dataframe that shares base columns
-                        if logging_backend is wandb:
-                            images = []
-                            for image_list in self._logs["images"]:
-                                images.append([wandb.Image(image) for image in image_list])
-                            df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
-                        elif logging_backend is trackio:
-                            # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
-                            logger.info("Skipping image logging for Trackio")
-                            df = df_base
+                        images = []
+                        for image_list in self._logs["images"]:
+                            images.append([wandb.Image(image) for image in image_list])
+                        df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
                     else:
                         df = df_base
 
                     if self.wandb_log_unique_prompts:
                         df = df.drop_duplicates(subset=["prompt"])
 
-                    logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+                if logging_backend == "trackio":
+                    if images_raw:
+                        # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/334
+                        logger.info("Skipping image logging for Trackio")
+                        df = df_base
+                        # images = []
+                        # for image_list in self._logs["images"]:
+                        #     images.append([trackio.Image(image) for image in image_list])
+                        # df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
+                    else:
+                        df = df_base
+
+                    trackio.log({"completions": trackio.Table(dataframe=df)})
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
