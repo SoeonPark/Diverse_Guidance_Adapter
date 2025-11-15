@@ -2328,14 +2328,6 @@ class DGRPOTrainer(BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        current_batch_size = prompt_ids.size(0)
-
-        mode = "train" if self.model.training else "eval"
-        max_batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
-
-        batch_size = min(current_batch_size, max_batch_size) if max_batch_size else current_batch_size
-        
-        breakpoint()
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
@@ -2343,7 +2335,6 @@ class DGRPOTrainer(BaseTrainer):
             attention_mask,
             logits_to_keep,
             compute_entropy=True,
-            batch_size=batch_size,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             num_images=inputs.get("num_images"),
@@ -2491,12 +2482,14 @@ class DGRPOTrainer(BaseTrainer):
             # Determine the slice indices for this adapter's completions
             if adapter_name == "default":
                 start_index = 0
-                end_index = self.num_generations_per_base_adapter
+                end_index = prompt_ids.size(0) 
+                breakpoint()
+                print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
             else:
                 guidance_index = int(adapter_name.split("_")[1]) # e.g., guidance_1 -> 1
                 start_index = self.num_generations_per_base_adapter + (guidance_index * self.num_generations_per_diversity_adapters)
                 end_index = start_index + self.num_generations_per_diversity_adapters
-            print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
+                print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
 
             # Slice inputs for the current adapter
             adapter_prompt_ids = prompt_ids[start_index:end_index]
@@ -2511,7 +2504,7 @@ class DGRPOTrainer(BaseTrainer):
                 "prompt_mask": adapter_prompt_mask,
                 "completion_ids": adapter_completion_ids,
                 "completion_mask": adapter_completion_mask,
-                "advantages": adapter_advantages[start_index:end_index],
+                "advantages": adapter_advantages,
                 "old_per_token_logps": old_logits_batch[adapter_name][start_index:end_index] if old_logits_batch[adapter_name] is not None else None,
                 "ref_per_token_logps": ref_logits_batch[adapter_name][start_index:end_index] if ref_logits_batch[adapter_name] is not None else None,
                 "num_items_in_batch": num_items_in_batch,
@@ -2528,7 +2521,12 @@ class DGRPOTrainer(BaseTrainer):
                 adapter_inputs["importance_sampling_ratio"] = inputs["importance_sampling_ratio"][start_index:end_index]
 
             # Compute loss for the current adapter
-            adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
+            if adapter_name == "default":
+                adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
+                loss_type = "Correctness"
+            elif adapter_name.startswith("guidance_"):
+                adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
+                loss_type = "Diversity"
 
             total_loss += adapter_loss
 
