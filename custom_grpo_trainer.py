@@ -881,7 +881,6 @@ class DGRPOTrainer(BaseTrainer):
         token_type_ids=None,
     ) -> dict[str, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
-        breakpoint()
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         breakpoint()
         all_logps = []
@@ -1720,7 +1719,7 @@ class DGRPOTrainer(BaseTrainer):
         ref_logits_batch = {}
 
         for adapter_index, adapter_name in enumerate(all_adapters):
-            print(f"  >> [Rollout] Computing logits for adapter: {adapter_name}")
+            print(f"  >> [Rollout] Computing logits for adapter: {adapter_name.upper()}")
             self.model.set_adapter(adapter_name)
             with torch.no_grad():
                 # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
@@ -1854,16 +1853,16 @@ class DGRPOTrainer(BaseTrainer):
                     completion_list_to_calculate.append(completions[i])
 
                 # breakpoint()
-                default_adapter_rewards = self._calculate_rewards(
+                correctness_rewards = self._calculate_rewards(
                     inputs,
                     prompts,
                     completion_list_to_calculate,
                     completion_ids_list,
                     current_adapter_name=adapter_name
                 )
-              # breakpoint()
-                all_rewards_list.append(default_adapter_rewards)
-              # breakpoint()
+                # breakpoint()
+                all_rewards_list.append(correctness_rewards)
+                # breakpoint()
                 # [Todo]
                 # -> From here, we can check if the final answer is correct or not for each completion
                 # if 'self.args.consider_correctness_in_diversity' is True:
@@ -1885,12 +1884,12 @@ class DGRPOTrainer(BaseTrainer):
 
                 adapter_rewards_list = []
 
-                for k in range(cur_num_generation):
+                for k in range(self.num_generations_per_diversity_adapters):
                     completion_index = current_start + k
-                    current_completion = completions[completion_index]
-                    current_input = inputs[completion_index]
-                    current_prompt = prompts[completion_index]
-                    current_completion_id = completion_ids_list[completion_index]
+                    current_completion = [completions[completion_index]]
+                    current_input = [inputs[completion_index]]
+                    current_prompt = [prompts[completion_index]]
+                    current_completion_id = [completion_ids_list[completion_index]]
 
                     # Prepare comparison completions from other adapters
                     comparison_completions = []
@@ -1919,10 +1918,10 @@ class DGRPOTrainer(BaseTrainer):
                             comparison_prompts.append(prompts[other_index])
                             completion_ids_for_comparison.append(completion_ids_list[other_index])
 
-                    all_completions_for_reward = [current_completion] + comparison_completions
-                    all_inputs_for_reward = [current_input] + comparison_inputs
-                    all_prompts_for_reward = [current_prompt] + comparison_prompts
-                    all_completion_ids_for_reward = [current_completion_id] + completion_ids_for_comparison
+                    all_completions_for_reward = current_completion + comparison_completions
+                    all_inputs_for_reward = current_input + comparison_inputs
+                    all_prompts_for_reward = current_prompt + comparison_prompts
+                    all_completion_ids_for_reward = current_completion_id + completion_ids_for_comparison
                     # breakpoint()
 
                     # Calculate rewards for Diversity
@@ -1993,7 +1992,7 @@ class DGRPOTrainer(BaseTrainer):
 
         # Compute grouped-wise rewards
         # First, check if each element is correct
-        if default_adapter_rewards is all_rewards_list[0]:
+        if correctness_rewards is all_rewards_list[0]:
             print(f"  >> [Reward Rollout] Verified correctness rewards from Default adapter match.")
         else:
             raise ValueError("Mismatch in correctness rewards from Default adapter.")
@@ -2032,12 +2031,13 @@ class DGRPOTrainer(BaseTrainer):
                 [0.],
                 [0.]], device='cuda:0')
         """
-        mean_grouped_default = correctness_rewards.view(-1, self.num_generations).mean(dim=1) # Already sliced for default adapter
+        # mean_grouped_correctenss = correctness_rewards.view(-1, self.num_generations).mean(dim=1) # Already sliced for default adapter
+        mean_grouped_correctenss = correctness_rewards.view(-1, self.num_generations).mean(dim=1) # Already sliced for default adapter
         # breakpoint()
-        mean_grouped_default = mean_grouped_default.repeat_interleave(self.num_generations, dim=0)
-        mean_grouped_default = mean_grouped_default.view(-1, 1)
+        mean_grouped_correctenss = mean_grouped_correctenss.repeat_interleave(self.num_generations, dim=0)
+        mean_grouped_correctenss = mean_grouped_correctenss.view(-1, 1)
         # breakpoint()
-        advantages_correctness = correctness_rewards - mean_grouped_default
+        advantages_correctness = correctness_rewards - mean_grouped_correctenss
         # breakpoint()
 
         std_correctness = correctness_rewards.view(-1, self.num_generations).std(dim=1)
@@ -2061,17 +2061,20 @@ class DGRPOTrainer(BaseTrainer):
         advantages_list.append(advantages_correctness)
         print(f"  >> [Advantage] Computed Correctness Advantages for Default Adapter.")
         print(f"        - Mean={advantages_correctness.mean().item():.4f}, Std={advantages_correctness.std().item():.4f}, Min={advantages_correctness.min().item():.4f}, Max={advantages_correctness.max().item():.4f}")
-        # breakpoint()
+        breakpoint()
 
         # 2. Diversity Advantages
         # Check elements from correctness_rewards to identify incorrect completions
         # REMAKR: Diversity rewards are computed with 1 completion from Guidance adapter + all completions from other adapters (1:N comparison) 
+        advantages_diversity_list = []
+        all_stds = [std_correctness]
+        
         for guidance_index in range(self.num_guidance_adapters):
             start_index = guidance_index * self.num_generations_per_diversity_adapters
             end_index = start_index + self.num_generations_per_diversity_adapters
 
             guidance_rewards = diversity_rewards[start_index:end_index]
-            # breakpoint()
+            breakpoint()
 
             if self.args.consider_correctness_in_diversity is True:
                 # Get correctness reward for corresponding completions
@@ -2079,8 +2082,11 @@ class DGRPOTrainer(BaseTrainer):
 
                 # Correctness rewards has all completions!!!!!
                 # -> Need to check the correctness for each completion in the current guidance_rewards
-                corresponding_correctness_rewards = correctness_rewards[start_index:end_index]
-                # breakpoint()
+                corresponding_correctness_rewards = correctness_rewards[
+                    self.num_generations_per_base_adapter + start_index:
+                    self.num_generations_per_base_adapter + end_index
+                ]
+                breakpoint()
 
                 # Create a mask for incorrect completions
                 correctness_mask = (corresponding_correctness_rewards > 0).float()  # 1.0 for correct, 0.0 for incorrect
@@ -2088,21 +2094,26 @@ class DGRPOTrainer(BaseTrainer):
                 print(f"        - Correctness Mask Sum: {correctness_mask.sum().item()} / {correctness_mask.numel()}")
 
                 guidance_rewards = guidance_rewards * correctness_mask
-                # breakpoint()
+                breakpoint()
 
             # Group-wise mean for diversity rewards
-            mean_grouped_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).mean(dim=1)
-            mean_grouped_diversity = mean_grouped_diversity.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
-            mean_grouped_diversity = mean_grouped_diversity.view(-1, 1)
+            # mean_grouped_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).mean(dim=1)
+            # mean_grouped_diversity = mean_grouped_diversity.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
+            # mean_grouped_diversity = mean_grouped_diversity.view(-1, 1)
+
+            mean_grouped_diversity = guidance_rewards.mean(dim=0, keepdim=True)
+            mean_grouped_diversity = mean_grouped_diversity.expand(self.num_generations_per_diversity_adapters, -1)
 
             advantages_diversity = guidance_rewards - mean_grouped_diversity
-            # breakpoint()
+            breakpoint()
 
             # Diversity advantages normalization
-            std_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).std(dim=1)
-            std_diversity = std_diversity.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
-            std_diversity = std_diversity.view(-1, 1)
-            # breakpoint()
+            # std_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).std(dim=1)
+            # std_diversity = std_diversity.repeat_interleave(self.num_generations_per_diversity_adapters, dim=0)
+            # std_diversity = std_diversity.view(-1, 1)
+            std_diversity = guidance_rewards.std(dim=0, keepdim=True)
+            std_diversity = std_diversity.expand(self.num_generations_per_diversity_adapters, -1)
+            breakpoint()
 
             if self.scale_rewards in ["group", "none"]:
                 # If self.scale_rewards = "none", we'll still log group level std
@@ -2120,23 +2131,20 @@ class DGRPOTrainer(BaseTrainer):
             if self.args.consider_correctness_in_diversity is True:
                 advantages_diversity = advantages_diversity * correctness_mask
 
-        advantages_list.append(advantages_diversity)
-        total_advantages = torch.cat(advantages_list, dim=0)
-        print(f"  >> [Advantage] Computed Diversity Advantages for Guidance Adapter {guidance_index}.")
-        print(f"        - Mean={advantages_diversity.mean().item():.4f}, Std={advantages_diversity.std().item():.4f}, Min={advantages_diversity.min().item():.4f}, Max={advantages_diversity.max().item():.4f}")
-        # breakpoint()
+            advantages_list.append(advantages_diversity)
+            total_advantages = torch.cat(advantages_list, dim=0)
+            print(f"  >> [Advantage] Computed Diversity Advantages for Guidance Adapter {guidance_index}.")
+            print(f"        - Mean={advantages_diversity.mean().item():.4f}, Std={advantages_diversity.std().item():.4f}, Min={advantages_diversity.min().item():.4f}, Max={advantages_diversity.max().item():.4f}")
+        breakpoint()
 
+        advantage_diversity_all = torch.cat(advantages_list, dim=0)
+        # total_advantages = torch.cat([advantages_correctness, advantage_diversity_all.sum(dim=-1, keepdim=True)], dim=0)
+        total_advantages = advantage_diversity_all
+        
+        breakpoint()
         # Concatenate all advantages as a single tensor
         # total_advantages[:self.num_generations] -> advantages_correctness
         # total_advantages[self.num_generations:self.num_generations_per_diversity_adapters] -> advantages_diversity ... so on
-        all_stds = [std_correctness]
-        # breakpoint()
-        """
-        (Pdb) len(all_stds)
-        1
-        (Pdb) len(all_stds[0])
-        10
-        """
         for guidance_index in range(self.num_guidance_adapters):
             start_index = guidance_index * self.num_generations_per_diversity_adapters
             end_index = start_index + self.num_generations_per_diversity_adapters
@@ -2457,7 +2465,7 @@ class DGRPOTrainer(BaseTrainer):
             inputs: Dict[str, Union[torch.Tensor, Any]],
             return_outputs: bool = False,
             num_items_in_batch: int | None = None,
-            ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         
         total_loss = 0.0
 
@@ -2482,8 +2490,7 @@ class DGRPOTrainer(BaseTrainer):
             # Determine the slice indices for this adapter's completions
             if adapter_name == "default":
                 start_index = 0
-                end_index = prompt_ids.size(0) 
-                breakpoint()
+                end_index = self.num_generations
                 print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
             else:
                 guidance_index = int(adapter_name.split("_")[1]) # e.g., guidance_1 -> 1
@@ -2491,13 +2498,14 @@ class DGRPOTrainer(BaseTrainer):
                 end_index = start_index + self.num_generations_per_diversity_adapters
                 print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
 
+            breakpoint()
             # Slice inputs for the current adapter
-            adapter_prompt_ids = prompt_ids[start_index:end_index]
-            adapter_prompt_mask = prompt_mask[start_index:end_index]
-            adapter_completion_ids = completion_ids[start_index:end_index]
-            adapter_completion_mask = completion_mask[start_index:end_index]
-            adapter_advantages = total_advantages[start_index:end_index]
-
+            adapter_prompt_ids = prompt_ids[0, ]
+            adapter_prompt_mask = prompt_mask[0, ]
+            adapter_completion_ids = completion_ids[0, start_index:end_index]
+            adapter_completion_mask = completion_mask[0, start_index:end_index]
+            adapter_advantages = total_advantages[0, start_index:end_index]
+            breakpoint()
             # Prepare adapter-specific inputs
             adapter_inputs = {
                 "prompt_ids": adapter_prompt_ids,
@@ -2523,9 +2531,11 @@ class DGRPOTrainer(BaseTrainer):
             # Compute loss for the current adapter
             if adapter_name == "default":
                 adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
+                print(f"  >> [Loss Computation] Completed Default Adapter Loss Computation.")
                 loss_type = "Correctness"
             elif adapter_name.startswith("guidance_"):
                 adapter_loss = self._compute_grpo_loss(model, adapter_inputs)
+                print(f"  >> [Loss Computation] Completed Guidance Adapter {adapter_name} Loss Computation.")
                 loss_type = "Diversity"
 
             total_loss += adapter_loss
