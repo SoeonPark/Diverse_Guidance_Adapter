@@ -882,7 +882,7 @@ class DGRPOTrainer(BaseTrainer):
     ) -> dict[str, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-        breakpoint()
+        # breakpoint()
         all_logps = []
         all_entropies = []
         for start in range(0, input_ids.size(0), batch_size):
@@ -1097,16 +1097,26 @@ class DGRPOTrainer(BaseTrainer):
                 10
                 (Pdb) scored_batch.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'advantages', 'all_adapters', 'old_per_token_logps_batch', 'ref_per_token_logps_batch', 'num_items_in_batch', 'old_per_token_logps'])
+                (Pdb) len(scored_batch['advantages'])
+                16      
+                (Pdb) scored_batch['advantages'].shape
+                torch.Size([16, 1])
                 """
                 scored_batch = split_pixel_values_by_grid(scored_batch)
                 # breakpoint()
                 """
                 (Pdb) scored_batch.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'advantages', 'all_adapters', 'old_per_token_logps_batch', 'ref_per_token_logps_batch', 'num_items_in_batch', 'old_per_token_logps'])
+                (Pdb) len(scored_batch['advantages'])
+                16
                 """
                 metadata = scored_batch.pop("_metadata")
                 scored_batch = shuffle_sequence_dict(scored_batch) # -> This one was the problem.... 
                 # breakpoint() # This is the Problem Point -- donot return only int dtype from '_generate_completions' (e.g., 'num_items_in_batch' etc.)
+                """
+                (Pdb) len(scored_batch['advantages'])
+                10
+                """
                 generation_batches = split_tensor_dict(scored_batch, self.args.steps_per_generation)
                 # breakpoint()
                 # self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
@@ -1594,6 +1604,7 @@ class DGRPOTrainer(BaseTrainer):
             batch_parts["completion_mask"].append(completion_mask)
 
             start_index = end_index
+            breakpoint()
 
         # Concatenate all adapters' generations
         prompt_ids = torch.cat(batch_parts["prompt_ids"], dim=0)
@@ -2061,7 +2072,7 @@ class DGRPOTrainer(BaseTrainer):
         advantages_list.append(advantages_correctness)
         print(f"  >> [Advantage] Computed Correctness Advantages for Default Adapter.")
         print(f"        - Mean={advantages_correctness.mean().item():.4f}, Std={advantages_correctness.std().item():.4f}, Min={advantages_correctness.min().item():.4f}, Max={advantages_correctness.max().item():.4f}")
-        breakpoint()
+        # breakpoint()
 
         # 2. Diversity Advantages
         # Check elements from correctness_rewards to identify incorrect completions
@@ -2074,7 +2085,7 @@ class DGRPOTrainer(BaseTrainer):
             end_index = start_index + self.num_generations_per_diversity_adapters
 
             guidance_rewards = diversity_rewards[start_index:end_index]
-            breakpoint()
+            # breakpoint()
 
             if self.args.consider_correctness_in_diversity is True:
                 # Get correctness reward for corresponding completions
@@ -2086,7 +2097,7 @@ class DGRPOTrainer(BaseTrainer):
                     self.num_generations_per_base_adapter + start_index:
                     self.num_generations_per_base_adapter + end_index
                 ]
-                breakpoint()
+                # breakpoint()
 
                 # Create a mask for incorrect completions
                 correctness_mask = (corresponding_correctness_rewards > 0).float()  # 1.0 for correct, 0.0 for incorrect
@@ -2094,7 +2105,7 @@ class DGRPOTrainer(BaseTrainer):
                 print(f"        - Correctness Mask Sum: {correctness_mask.sum().item()} / {correctness_mask.numel()}")
 
                 guidance_rewards = guidance_rewards * correctness_mask
-                breakpoint()
+                # breakpoint()
 
             # Group-wise mean for diversity rewards
             # mean_grouped_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).mean(dim=1)
@@ -2105,7 +2116,7 @@ class DGRPOTrainer(BaseTrainer):
             mean_grouped_diversity = mean_grouped_diversity.expand(self.num_generations_per_diversity_adapters, -1)
 
             advantages_diversity = guidance_rewards - mean_grouped_diversity
-            breakpoint()
+            # breakpoint()
 
             # Diversity advantages normalization
             # std_diversity = guidance_rewards.view(-1, self.num_generations_per_diversity_adapters).std(dim=1)
@@ -2113,7 +2124,7 @@ class DGRPOTrainer(BaseTrainer):
             # std_diversity = std_diversity.view(-1, 1)
             std_diversity = guidance_rewards.std(dim=0, keepdim=True)
             std_diversity = std_diversity.expand(self.num_generations_per_diversity_adapters, -1)
-            breakpoint()
+            # breakpoint()
 
             if self.scale_rewards in ["group", "none"]:
                 # If self.scale_rewards = "none", we'll still log group level std
@@ -2135,13 +2146,13 @@ class DGRPOTrainer(BaseTrainer):
             total_advantages = torch.cat(advantages_list, dim=0)
             print(f"  >> [Advantage] Computed Diversity Advantages for Guidance Adapter {guidance_index}.")
             print(f"        - Mean={advantages_diversity.mean().item():.4f}, Std={advantages_diversity.std().item():.4f}, Min={advantages_diversity.min().item():.4f}, Max={advantages_diversity.max().item():.4f}")
-        breakpoint()
+        # breakpoint()
 
         advantage_diversity_all = torch.cat(advantages_list, dim=0)
         # total_advantages = torch.cat([advantages_correctness, advantage_diversity_all.sum(dim=-1, keepdim=True)], dim=0)
         total_advantages = advantage_diversity_all
         
-        breakpoint()
+        # breakpoint()
         # Concatenate all advantages as a single tensor
         # total_advantages[:self.num_generations] -> advantages_correctness
         # total_advantages[self.num_generations:self.num_generations_per_diversity_adapters] -> advantages_diversity ... so on
@@ -2233,19 +2244,13 @@ class DGRPOTrainer(BaseTrainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "advantages": total_advantages,
-            # "all_adapters": all_adapters,
-            # "old_per_token_logps_batch": old_logits_batch,
-            # "ref_per_token_logps_batch": ref_logits_batch,
-            # # "advantages_diversity": advantages_diversity,  # Placeholder for diversity advantages
-            # "num_items_in_batch": num_items_in_batch,
         }
-        if old_per_token_logps is not None:
-            output_to_shuffle["old_per_token_logps"] = old_per_token_logps
+        # if old_per_token_logps is not None:
+        #     output_to_shuffle["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction:
             output_to_shuffle["importance_sampling_ratio"] = importance_sampling_ratio
-        if ref_per_token_logps is not None:
-            output_to_shuffle["ref_per_token_logps"] = ref_per_token_logps
+        # if ref_per_token_logps is not None:
+        #     output_to_shuffle["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
             output_to_shuffle["pixel_values"] = forward_kwargs["pixel_values"]
         if "image_grid_thw" in forward_kwargs:
@@ -2260,6 +2265,7 @@ class DGRPOTrainer(BaseTrainer):
         metadata = {
             "num_items_in_batch": num_items_in_batch,
             "all_adapters": all_adapters,
+            "advantages": total_advantages,
             "old_per_token_logps_batch": old_logits_batch,
             "ref_per_token_logps_batch": ref_logits_batch,
         }
@@ -2268,6 +2274,7 @@ class DGRPOTrainer(BaseTrainer):
             **output_to_shuffle,
             "_metadata": metadata,
         }
+        # breakpoint()
 
         return output
 
@@ -2322,19 +2329,23 @@ class DGRPOTrainer(BaseTrainer):
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
         elif self.args.use_original_grpo_loss:
-            return self._compute_loss_grpo_original(model, inputs)
+            return self._compute_grpo_loss(model, inputs)
         else:
             return self._compute_loss(model, inputs)
         
     # [Custom]
     def _compute_grpo_loss(self, model, inputs):
+        # breakpoint()
         """ This is the original compute_loss from GRPOTrainer """
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        # breakpoint()
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        # breakpoint()
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        # breakpoint()
 
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -2474,12 +2485,16 @@ class DGRPOTrainer(BaseTrainer):
         all_adapters = metadata["all_adapters"] # List of all adapter names used in this batch
         old_logits_batch = metadata["old_per_token_logps_batch"]  # Dict to store old logits per adapter
         ref_logits_batch = metadata["ref_per_token_logps_batch"]  # Dict to store ref logits per
+        total_advantages = metadata["advantages"]  # Combined advantages for all adapters
+        num_items_in_batch = metadata["num_items_in_batch"]
 
         prompt_ids = inputs["prompt_ids"]
         prompt_mask = inputs["prompt_mask"]
         completion_ids = inputs["completion_ids"]
         completion_mask = inputs["completion_mask"]
-        total_advantages = inputs["advantages"]
+
+        batch_size = prompt_ids.size(0)
+        # breakpoint()
 
         # Process each adapter separately
         for adapter_index, adapter_name in enumerate(all_adapters):
@@ -2498,25 +2513,37 @@ class DGRPOTrainer(BaseTrainer):
                 end_index = start_index + self.num_generations_per_diversity_adapters
                 print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
 
-            breakpoint()
+            # breakpoint()
             # Slice inputs for the current adapter
-            adapter_prompt_ids = prompt_ids[0, ]
-            adapter_prompt_mask = prompt_mask[0, ]
-            adapter_completion_ids = completion_ids[0, start_index:end_index]
-            adapter_completion_mask = completion_mask[0, start_index:end_index]
-            adapter_advantages = total_advantages[0, start_index:end_index]
-            breakpoint()
+            # adapter_prompt_ids = prompt_ids[0, ]
+            # adapter_prompt_mask = prompt_mask[0, ]
+            # adapter_completion_ids = completion_ids[0, ]
+            # adapter_completion_mask = completion_mask[0, ]
+            # adapter_advantages = total_advantages[start_index:end_index, 0]
+            # breakpoint()
+
             # Prepare adapter-specific inputs
+            # adapter_inputs = {
+            #     "prompt_ids": adapter_prompt_ids,
+            #     "prompt_mask": adapter_prompt_mask,
+            #     "completion_ids": adapter_completion_ids,
+            #     "completion_mask": adapter_completion_mask,
+            #     "advantages": adapter_advantages,
+            #     "old_per_token_logps": old_logits_batch[adapter_name][start_index:end_index] if old_logits_batch[adapter_name] is not None else None,
+            #     "ref_per_token_logps": ref_logits_batch[adapter_name][start_index:end_index] if ref_logits_batch[adapter_name] is not None else None,
+            #     "num_items_in_batch": num_items_in_batch,
+            # }
             adapter_inputs = {
-                "prompt_ids": adapter_prompt_ids,
-                "prompt_mask": adapter_prompt_mask,
-                "completion_ids": adapter_completion_ids,
-                "completion_mask": adapter_completion_mask,
-                "advantages": adapter_advantages,
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "completion_ids": completion_ids,
+                "completion_mask": completion_mask,
+                "advantages": total_advantages[start_index:end_index, 0],
                 "old_per_token_logps": old_logits_batch[adapter_name][start_index:end_index] if old_logits_batch[adapter_name] is not None else None,
                 "ref_per_token_logps": ref_logits_batch[adapter_name][start_index:end_index] if ref_logits_batch[adapter_name] is not None else None,
                 "num_items_in_batch": num_items_in_batch,
             }
+            # breakpoint()
 
             # Vision related ones but not used in mine
             if "pixel_values" in inputs:
