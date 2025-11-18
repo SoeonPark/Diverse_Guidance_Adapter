@@ -469,7 +469,7 @@ class DGRPOTrainer(BaseTrainer):
         self.num_generations_per_base_adapter = args.num_generations_per_base_adapter
 
         texts = list(self.train_dataset['problem'])
-        self.log_test_inputs = self.tokenizer(
+        self.log_inputs = self.tokenizer(
             texts,
             padding=True,
             truncation=True,
@@ -1604,13 +1604,63 @@ class DGRPOTrainer(BaseTrainer):
             batch_parts["completion_mask"].append(completion_mask)
 
             start_index = end_index
-            breakpoint()
+            # breakpoint()
+
+        # Align padding lengths ACROSS ADAPTERS
+        max_prompt_length = max(ids.size(1) for ids in batch_parts["prompt_ids"])
+        max_completion_length = max(ids.size(1) for ids in batch_parts["completion_ids"])
+
+        padded_prompt_ids = []
+        padded_prompt_mask = []
+        padded_completion_ids = []
+        padded_completion_mask = []
+
+        for prompt_ids, prompt_mask, completion_ids, completion_mask in zip(
+            batch_parts["prompt_ids"],
+            batch_parts["prompt_mask"],
+            batch_parts["completion_ids"],
+            batch_parts["completion_mask"],
+        ):
+            # Prompt Padding (left side)
+            if prompt_ids.size(1) < max_prompt_length:
+                pad_length = max_prompt_length - prompt_ids.size(1)
+                prompt_ids = torch.cat([
+                    torch.full((prompt_ids.size(0), pad_length), self.pad_token_id, dtype=prompt_ids.dtype, device=device),
+                    prompt_ids
+                ], dim=1)
+                prompt_mask = torch.cat([
+                    torch.zeros((prompt_mask.size(0), pad_length), dtype=prompt_mask.dtype, device=device),
+                    prompt_mask
+                ], dim=1)
+
+            # Completion Padding (right side)
+            if completion_ids.size(1) < max_completion_length:
+                pad_length = max_completion_length - completion_ids.size(1)
+                completion_ids = torch.cat([
+                    completion_ids,
+                    torch.full((completion_ids.size(0), pad_length), self.pad_token_id, dtype=completion_ids.dtype, device=device)
+                ], dim=1)
+                completion_mask = torch.cat([
+                    completion_mask,
+                    torch.zeros((completion_mask.size(0), pad_length), dtype=completion_mask.dtype, device=device)
+                ], dim=1)
+
+            padded_prompt_ids.append(prompt_ids)
+            padded_prompt_mask.append(prompt_mask)
+            padded_completion_ids.append(completion_ids)
+            padded_completion_mask.append(completion_mask)
 
         # Concatenate all adapters' generations
-        prompt_ids = torch.cat(batch_parts["prompt_ids"], dim=0)
-        prompt_mask = torch.cat(batch_parts["prompt_mask"], dim=0)
-        completion_ids = torch.cat(batch_parts["completion_ids"], dim=0)
-        completion_mask = torch.cat(batch_parts["completion_mask"], dim=0)
+        # prompt_ids = torch.cat(batch_parts["prompt_ids"], dim=0)
+        # prompt_mask = torch.cat(batch_parts["prompt_mask"], dim=0)
+        # completion_ids = torch.cat(batch_parts["completion_ids"], dim=0)
+        # completion_mask = torch.cat(batch_parts["completion_mask"], dim=0)
+
+        prompt_ids = torch.cat(padded_prompt_ids, dim=0)
+        prompt_mask = torch.cat(padded_prompt_mask, dim=0)
+        completion_ids = torch.cat(padded_completion_ids, dim=0)
+        completion_mask = torch.cat(padded_completion_mask, dim=0)
+
         # breakpoint()
         """
         (Pdb) prompt_ids.shape
@@ -1619,8 +1669,23 @@ class DGRPOTrainer(BaseTrainer):
         torch.Size([10, 256])
         """
 
+        # if all_sampling_logps:
+        #     sampling_per_token_logps = torch.cat(all_sampling_logps, dim=0)
+        # else:
+        #     sampling_per_token_logps = None
+
         if all_sampling_logps:
-            sampling_per_token_logps = torch.cat(all_sampling_logps, dim=0)
+            max_logps_len = max(logps.size(1) for logps in all_sampling_logps)
+            padded_logps = []
+            for logps in all_sampling_logps:
+                if logps.size(1) < max_logps_len:
+                    pad_length = max_logps_len - logps.size(1)
+                    logps = torch.cat([
+                        logps,
+                        torch.zeros((logps.size(0), pad_length), dtype=logps.dtype, device=device)
+                    ], dim=1)
+                padded_logps.append(logps)
+            sampling_per_token_logps = torch.cat(padded_logps, dim=0)
         else:
             sampling_per_token_logps = None
 
@@ -2513,26 +2578,6 @@ class DGRPOTrainer(BaseTrainer):
                 end_index = start_index + self.num_generations_per_diversity_adapters
                 print(f"        - Completion Slice Indices: [{start_index}:{end_index}]")
 
-            # breakpoint()
-            # Slice inputs for the current adapter
-            # adapter_prompt_ids = prompt_ids[0, ]
-            # adapter_prompt_mask = prompt_mask[0, ]
-            # adapter_completion_ids = completion_ids[0, ]
-            # adapter_completion_mask = completion_mask[0, ]
-            # adapter_advantages = total_advantages[start_index:end_index, 0]
-            # breakpoint()
-
-            # Prepare adapter-specific inputs
-            # adapter_inputs = {
-            #     "prompt_ids": adapter_prompt_ids,
-            #     "prompt_mask": adapter_prompt_mask,
-            #     "completion_ids": adapter_completion_ids,
-            #     "completion_mask": adapter_completion_mask,
-            #     "advantages": adapter_advantages,
-            #     "old_per_token_logps": old_logits_batch[adapter_name][start_index:end_index] if old_logits_batch[adapter_name] is not None else None,
-            #     "ref_per_token_logps": ref_logits_batch[adapter_name][start_index:end_index] if ref_logits_batch[adapter_name] is not None else None,
-            #     "num_items_in_batch": num_items_in_batch,
-            # }
             adapter_inputs = {
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
@@ -2596,7 +2641,7 @@ class DGRPOTrainer(BaseTrainer):
         print("\n ==== Trainer Log Step; For Running Adapter Logits Check =====")
 
         device = self.accelerator.device
-        test_inputs = self.log_test_inputs.to(device)
+        inputs = self.log_inputs.to(device)
 
         model = self.accelerator.unwrap_model(self.model)
         logits_states = {}
@@ -2604,13 +2649,12 @@ class DGRPOTrainer(BaseTrainer):
         adapter_name = "default"
         model.set_adapter(adapter_name)
         with torch.no_grad():
-            outputs = model(**test_inputs, output_hidden_states=True, return_dict=True)
+            outputs = model(**inputs, output_hidden_states=False, return_dict=True)
             logits_states[f"adapter_{adapter_name}"] = outputs.logits
             # Collect hidden states from all layers
             print(f"  >> Logits from Default Adapter: {outputs.logits}")
             print(f"  >> Mean Logits from Default Adapter: {outputs.logits.mean().item()}")
         print(model.active_adapter)
-        # model.reset_adapter()
 
         for i in range(self.num_guidance_adapters):
             adapter_name = f"guidance_{i}"
@@ -2618,7 +2662,7 @@ class DGRPOTrainer(BaseTrainer):
             print(model.active_adapter)
 
             with torch.no_grad():
-                outputs = model(**test_inputs, output_hidden_states=True, return_dict=True)
+                outputs = model(**inputs, output_hidden_states=False, return_dict=True)
                 logits_states[f"adapter_{adapter_name}"] = outputs.logits
                 # Collect hidden states from all layers
                 for layer_idx, hidden_state in enumerate(outputs.hidden_states):
