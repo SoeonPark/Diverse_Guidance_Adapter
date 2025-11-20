@@ -90,8 +90,8 @@ from transformers.utils import (
     is_torch_xla_available,
     is_torch_xpu_available,
     is_torchao_available,
-    logging,
-    strtobool,
+    logging, strtobool,
+    is_accelerate_available
 )
 
 if is_accelerate_available():
@@ -147,7 +147,7 @@ RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 # "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
 RolloutFunc = Callable[[list[str], Any, Any], dict[str, Any]]
 
-class ValSETrainer(GRPOTrainer):
+class ValSETrainer(BaseTrainer):
 
     _tag_names = ["trl", "grpo"]
     _name = "GRPO"
@@ -247,8 +247,7 @@ class ValSETrainer(GRPOTrainer):
         self.eos_token_id = tokenizer.eos_token_id
 
         # Reward functions
-        if not isinstance(reward_funcs_correctness, list):
-            reward_funcs_correctness = [reward_funcs_correctness]
+        # Correctness reward functions
         self.reward_func_names = []
         for i, reward_func in enumerate(reward_funcs_correctness):
             if isinstance(reward_func, str):
@@ -260,10 +259,10 @@ class ValSETrainer(GRPOTrainer):
             else:
                 self.reward_func_names.append(reward_funcs_correctness[i].__name__)
         self.reward_funcs_correctness = reward_funcs_correctness
+        self.reward_func_names_correctness = self.reward_func_names.copy()
 
-        if not isinstance(reward_funcs_diversity, list):
-            reward_funcs_diversity = [reward_funcs_diversity]
-        self.reward_func_names += []
+        # Diversity reward functions
+        self.reward_func_names_diversity = []
         for i, reward_func in enumerate(reward_funcs_diversity):
             if isinstance(reward_func, str):
                 reward_funcs_diversity[i] = AutoModelForSequenceClassification.from_pretrained(
@@ -274,6 +273,38 @@ class ValSETrainer(GRPOTrainer):
             else:
                 self.reward_func_names.append(reward_funcs_diversity[i].__name__)
         self.reward_funcs_diversity = reward_funcs_diversity
+        self.reward_func_names.extend(self.reward_func_names_diversity)
+
+        # Set List of Adapter names to be used in this Trainer
+        if adapter_name is None:
+            self.adapter_names = ["default"]
+            self.num_generations_per_adapter = [args.num_generations_per_base_adapter]
+            reward_func_names = self.reward_func_names_correctness
+        elif isinstance(adapter_name, str):
+            self.adapter_names = [adapter_name]
+            self.num_generations_per_adapter = [args.num_generations_per_diversity_adapters]
+            reward_func_names = self.reward_func_names_diversity
+        else:
+            self.adapter_names = list(adapter_name)
+            self.num_generations_per_adapter = []
+            for adapter in self.adapter_names:
+                if adapter == "default":
+                    self.num_generations_per_adapter.append(args.num_generations_per_base_adapter)
+                elif adapter.startswith("guidance_"):
+                    self.num_generations_per_adapter.append(args.num_generations_per_diversity_adapter)
+                else:
+                    self.num_generations_per_adapter.append(args.num_generations)
+
+        self.total_num_generations = sum(self.num_generations_per_adapter)
+
+        if is_peft_available() and isinstance(model, PeftModel):
+            for adapter_name in self.adapter_names:
+                if adapter_name != "default":
+                    try:
+                        model.set_adapter(adapter_name)
+                        logger.info(f"Adapter '{adapter_name}' is available")
+                    except:
+                        logger.warning(f"Adapter '{adapter_name}' not found in model")
 
         # Reward weights
         if args.reward_weights is not None:
@@ -285,18 +316,6 @@ class ValSETrainer(GRPOTrainer):
             self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
             self.reward_weights = torch.ones(len(reward_funcs_correctness), dtype=torch.float32)
-
-        # Set List of Adapter names to be used in this Trainer
-        self.adapter_name = []
-        for adapter_index, adapter_name in enumerate(adapter_name):
-            if adapter_name is not None and is_peft_available() and isinstance(model, PeftModel):
-                model.set_adapter(adapter_name)
-                logger.info(f"Using adapter '{adapter_name}' for reward function '{self.reward_func_names[adapter_index]}'")
-                if adapter_name == "default":
-                    self.curr_num_generations = args.num_generations_per_base_adapter
-                elif adapter_name.startswith("guidance_"):
-                    self.curr_num_generations = args.num_generations_per_diversity_adapter
-        self.adapter_name.append(adapter_name)
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -621,12 +640,12 @@ class ValSETrainer(GRPOTrainer):
     
     # [Not originally in GRPO] In transformers.Trainer:
     # Not Modified yet
+
     def training_step(
         self,
         model: nn.Module,
         inputs: dict[str, Union[torch.Tensor, Any]],
         num_items_in_batch: Optional[torch.Tensor] = None,
-        curr_num_generations: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -644,35 +663,39 @@ class ValSETrainer(GRPOTrainer):
 
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
-
-        Not forwarding 16 completions at once, split them with their own batches
-            e.g., default: 10, guidance_1: 3, guidance_2: 3
-            16 = 10 + 3 + 3
         """
         # Prepare buffers for context parallelism
+        breakpoint()
 
-        for adapter_name in self.adapter_name:
-            
-            if adapter_name == "default":
-                self.curr_num_generations = args.num_generations
+        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
 
-            cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+        # Context manager is no-op if CP isn't enabled
+        with cp_context():
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
 
-            # Context manager is no-op if CP isn't enabled
-            with cp_context():
-                model.train()
-                if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
-                    self.optimizer.train()
+            breakpoint()
 
-                inputs = self._prepare_inputs(inputs)
-                if is_sagemaker_mp_enabled():
-                    loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-                    return loss_mb.reduce_mean().detach().to(self.args.device)
+            inputs = self._prepare_inputs(inputs)
+
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            adapter_names = inputs["adapter_info"]["adapter_names"]
+            num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
+
+            total_loss = 0.0
+
+            for adapter_index, (adapter_name, num_generation) in enumerate(zip(adapter_names, num_generations_per_adapter)):
+                model.set_adapter(adapter_name)
+                
+                adapter_inputs = self._slice_inputs_for_adapter(inputs, adapter_index)
 
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
-                del inputs
                 if (
                     self.args.torch_empty_cache_steps is not None
                     and self.state.global_step % self.args.torch_empty_cache_steps == 0
@@ -722,8 +745,46 @@ class ValSETrainer(GRPOTrainer):
                         kwargs["scale_wrt_gas"] = False
 
                     self.accelerator.backward(loss, **kwargs)
+                
+                total_loss += loss.detach()
 
-            return loss.detach()
+                del adapter_inputs
+
+                return total_loss
+            
+    def _slice_inputs_for_adapter(
+        self,
+        inputs: dict[str, Union[torch.Tensor, Any]],
+        adapter_index: int,
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        adapter_names = inputs["adapter_info"]["adapter_names"]
+        num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
+
+        batch_size = inputs["prompt"].size(0)
+        start_index = sum(num_generations_per_adapter[:adapter_index]) * batch_size
+        end_index = start_index + num_generations_per_adapter[adapter_index] * batch_size
+
+        adapter_inputs = {}
+
+        for key in ["prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "advantages"]:
+            if key in inputs and inputs[key] is not None:
+                adapter_inputs[key] = inputs[key][start_index:end_index]
+
+        for key in ["old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps", 
+                    "importance_sampling_ratio", "token_type_ids"]:
+            if key in inputs and inputs[key] is not None:
+                adapter_inputs[key] = inputs[key][start_index:end_index]
+
+        for key in ["adapter_info", "num_items_in_batch"]:
+            if key in inputs:
+                adapter_inputs[key] = inputs[key]
+
+        adapter_inputs["adapter_info"] = {
+            "adapter_names": [adapter_names[adapter_index]],
+            "num_generations_per_adapter": [num_generations_per_adapter[adapter_index]],
+        }
+
+        return adapter_inputs
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1120,8 +1181,31 @@ class ValSETrainer(GRPOTrainer):
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
+                original_inputs = generation_batch
+                breakpoint()
                 generation_batch = self._generate_completions(generation_batch)
-
+                breakpoint()
+                scored_outputs = self._score_completions(original_inputs, generation_batch)
+                breakpoint()
+                """
+                (Pdb) scored_outputs.keys()
+                dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'num_items_in_batch', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'adapter_info', 'advantages'])
+                """
+                scored_outputs = split_pixel_values_by_grid(scored_outputs)
+                breakpoint()
+                scored_outputs = shuffle_sequence_dict(scored_outputs)
+                scored_outputs = split_tensor_dict(scored_outputs, self.args.steps_per_generation)
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in scored_outputs]
+            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+            self._step += 1
+        else:
+            # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
+            # local generation batch == local eval batch
+            original_inputs = generation_batch
+            inputs = self._generate_completions(generation_batch)
+            inputs = self._score_completions(original_inputs, inputs)
+        return inputs
+    
     # Calculate Rewards (Correctness and Diversity)
     @profiling_decorator
     def _calculate_rewards_correctness(
@@ -1584,7 +1668,7 @@ class ValSETrainer(GRPOTrainer):
 
     # Split Generation step and Scoring step for easier overriding in subclasses
     def _generate_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]], adapter_name: str = None
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         """
         Generates completions for the given prompts using vLLM and adds them to the generation batch.
@@ -1596,37 +1680,45 @@ class ValSETrainer(GRPOTrainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        total_output = {}
+        all_prompt_ids_list = []
+        all_completion_ids_list = []
+        all_sampling_per_token_logps_list = []
+        all_extra_fields_list = []
+        total_num_items = 0
 
-        for _ in range(self.adapter_name):
-            outputs = {}
-            self.model.set_adapter(self.adapter_name)
-            print(f"  >> [Rollout] Using adapter: {self.adapter_name}")
+        # Generate completions by adapters
+        for adapter_index, (adapter_name, num_generations) in enumerate(zip(self.adapter_names, self.num_generations_per_adapter)):
+            if is_peft_available() and isinstance(self.model, PeftModel):
+                self.model.set_adapter(adapter_name)
+            print(f"  >> [Rollout] Generating {num_generations} completions using adapter '{adapter_name}'")
+            
+            # Repeat each prompt 'num_generations' times for the current adapter
+            prompts = [x["prompt"] for x in inputs] * num_generations
 
-            for _ in range(self.curr_num_generations):
-                prompts = [x["prompt"] for x in inputs]
-                prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                    self._generate(prompts)
-                )
-            outputs["prompt_ids"] = prompt_ids_list
-            outputs["completion_ids"] = completion_ids_list
-            outputs["num_items_in_batch"] = num_items_in_batch
-            outputs["sampling_per_token_logps"] = sampling_per_token_logps_list
-            outputs["extra_fields"] = extra_fields
+            prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
+                self._generate(prompts)
+            )
 
-        total_output[self.adapter_name] = outputs
+            all_prompt_ids_list.extend(prompt_ids_list)
+            all_completion_ids_list.extend(completion_ids_list)
+            if sampling_per_token_logps_list is not None:
+                all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
+            all_extra_fields_list.append(extra_fields)
+            total_num_items += num_items_in_batch
 
         # Convert lists of token IDs to padded tensors
-        prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+        prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
-        completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+
+        completion_ids = [torch.tensor(ids, device=device) for ids in all_completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
         completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
-        if sampling_per_token_logps_list is not None:
-            sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in sampling_per_token_logps_list]
+
+        if all_sampling_per_token_logps_list:
+            sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in all_sampling_per_token_logps_list]
             sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
         else:
             sampling_per_token_logps = None
@@ -1645,7 +1737,7 @@ class ValSETrainer(GRPOTrainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         num_images = None
-        forward_kwargs = None
+        forward_kwargs = {}
 
         # If token_type_ids are used, extend them with zeros for the completion part
         if "token_type_ids" in forward_kwargs:
@@ -1678,13 +1770,6 @@ class ValSETrainer(GRPOTrainer):
             else:
                 old_per_token_logps = None
 
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
-                importance_sampling_ratio = torch.clamp(
-                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                )
-
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
@@ -1711,50 +1796,25 @@ class ValSETrainer(GRPOTrainer):
             else:
                 ref_per_token_logps = None
 
-        # Decode
-        prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-
-        if is_conversational(inputs[0]):
-            completions = []
-            for prompt, completion in zip(prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        else:
-            completions = completions_text
-
-        # Merge extra_fields from rollout_func into inputs for reward functions
-        if extra_fields:
-            for i, inp in enumerate(inputs):
-                for key, values in extra_fields.items():
-                    if isinstance(values, list) and i < len(values):
-                        inp[key] = values[i]
-                    elif not isinstance(values, list):
-                        inp[key] = values
-
-
-        total_output = {
+        return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "advantages": advantages,
-            "num_items_in_batch": num_items_in_batch,
+            "num_items_in_batch": total_num_items,
+            "old_per_token_logps": old_per_token_logps if 'old_per_token_logps' in locals() else None,
+            "ref_per_token_logps": ref_per_token_logps if 'ref_per_token_logps' in locals() else None,
+            "sampling_per_token_logps": sampling_per_token_logps,
+            "all_extra_fields": all_extra_fields_list,
+            "adapter_info": {
+                "adapter_names": self.adapter_names,
+                "num_generations_per_adapter": self.num_generations_per_adapter,
+            }
         }
-        if old_per_token_logps is not None:
-            total_output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            total_output["importance_sampling_ratio"] = importance_sampling_ratio
-        if ref_per_token_logps is not None:
-            total_output["ref_per_token_logps"] = ref_per_token_logps
-        if "token_type_ids" in forward_kwargs:
-            total_output["token_type_ids"] = forward_kwargs["token_type_ids"]
-
-        return total_output # 다시해야됨 {dict, dict, dict} 이런식으로 base+adapters 수만큼 dict로 분리를 하자
-        # 근데 이제 모든 adapters로 부터 나온 Completions의 max_length 기준 padding 신경써서
     
     def _score_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
+            self, inputs: dict[str, Union[torch.Tensor, Any]], 
+            generation_batch: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         """
         Scores the generated completions by computing log-probabilities using the model and adds them to the
@@ -1768,30 +1828,94 @@ class ValSETrainer(GRPOTrainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        for i in range(self.adapter_name):
-            self.model.set_adapter(self.adapter_name)
-            inputs = self._prepare_inputs(inputs)
-            prompts = inputs[i]["prompt"]
-            prompt_ids = inputs[i]["prompt_ids"]
-            completions = inputs[i]["completion"]
-            completions_text = inputs[i]["completion_text"]
-            completion_mask = inputs[i]["completion_mask"]
-            sampling_per_token_logps = inputs[i]["sampling_per_token_logps"]
-            importance_sampling_ratio = inputs[i].get("importance_sampling_ratio", None)
-            completion_ids_list = inputs[i]["completion_ids"]
-            old_per_token_logps = inputs[i]["old_per_token_logps"]
-            ref_per_token_logps = inputs[i]["ref_per_token_logps"]
+        prompts = [x["prompt"] for x in inputs]
 
-            print(f"  >> [Scoring] Using adapter: {self.adapter_name}")
+        prompt_ids = generation_batch["prompt_ids"]
+        completion_ids = generation_batch["completion_ids"]
+        completion_mask = generation_batch["completion_mask"]
+        sampling_per_token_logps = generation_batch.get("sampling_per_token_logps", None)
+        old_per_token_logps = generation_batch.get("old_per_token_logps", None)
+        ref_per_token_logps = generation_batch.get("ref_per_token_logps", None)
+        all_extra_fields = generation_batch.get("all_extra_fields", None)
 
-            if self.adapter_name == "default":
-                rewards_per_func = self._calculate_rewards_correctness(inputs, prompts, completions, completion_ids_list)
-                curr_num_generations = self.num_generations
-            elif self.adapter_name == "diversity":
-                rewards_per_func = self._calculate_rewards_diversity(inputs, prompts, completions, completion_ids_list)
+        adapter_names = generation_batch["adapter_info"]["adapter_names"]
+        num_generations_list = generation_batch["adapter_info"]["num_generations_per_adapter"]
+
+        # Decode
+        prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        completion_ids_list = [ids[mask.bool()].tolist() for ids, mask in zip(completion_ids, completion_mask)]
+        
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        # breakpoint()
+        if all_extra_fields is not None:
+            if all_extra_fields and isinstance(all_extra_fields, dict):
+                for i, input_example in enumerate(inputs):
+                    for key, values in all_extra_fields.items():
+                        if isinstance(values, list) and i < len(values):
+                            input_example[key] = values[i]
+                        elif not isinstance(values, list):
+                            input_example[key] = values
+            elif all_extra_fields and isinstance(all_extra_fields, list):
+                for i, input_example in enumerate(inputs):
+                    if i < len(all_extra_fields) and isinstance(all_extra_fields[i], dict):
+                        input_example.update(all_extra_fields[i])
+
+        all_rewards_per_func = []
+        all_advantages = []
+
+        # Score completions by adapters
+        start_index = 0
+        for adapter_index, (adapter_name, num_generations) in enumerate(zip(adapter_names, num_generations_list)):
+            end_index = start_index + len(prompts_text) * num_generations
+
+            curr_prompts = prompts_text[start_index:end_index]
+            curr_completions = [completions[i] for i in range(start_index, end_index)]
+            curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
+
+            # Extract other adapters' data (if needed for diversity calculation)
+            if adapter_name.startswith("guidance_"):
+                other_prompt_ids = torch.cat([prompt_ids[:start_index], prompt_ids[end_index:]], dim=0)
+                other_completion_ids = torch.cat([completion_ids[:start_index], completion_ids[end_index:]], dim=0)
+                other_completion_mask = torch.cat([completion_mask[:start_index], completion_mask[end_index:]], dim=0)
+                other_sampling_per_token_logps = torch.cat(
+                    [sampling_per_token_logps[:start_index], sampling_per_token_logps[end_index:]], dim=0
+                ) if sampling_per_token_logps is not None else None
+                
+                # Create dict for other adapters' data
+                other_adapter_data = {
+                    "prompt_ids": other_prompt_ids,
+                    "completion_ids": other_completion_ids,
+                    "completion_mask": other_completion_mask,
+                    "sampling_per_token_logps": other_sampling_per_token_logps,
+                }
             else:
-                raise ValueError(f"Unknown adapter name: {self.adapter_name}")
-            
+                other_adapter_data = None
+                
+            self.model.set_adapter(adapter_name) 
+            print(f"  >> [Scoring] Using adapter: {adapter_name}")
+
+            if adapter_name == "default":
+                rewards_per_func = self._calculate_rewards_correctness(
+                    inputs, curr_prompts, curr_completions, curr_completion_ids_list
+                )
+                curr_num_generations = self.num_generations
+            elif adapter_name.startswith("guidance_"):
+                rewards_per_func = self._calculate_rewards_diversity(
+                    inputs, curr_prompts, curr_completions, curr_completion_ids_list,
+                    other_adapter_data = other_adapter_data
+                )
+                curr_num_generations = num_generations
+            else:
+                raise ValueError(f"Unknown adapter name: {adapter_name}")
+
             # Apply weights to each reward function's output and sum
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
@@ -1818,69 +1942,91 @@ class ValSETrainer(GRPOTrainer):
             if self.scale_rewards != "none":
                 advantages = advantages / (std_rewards + 1e-4)
 
-            # Slice to keep only the local part of the data
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
-            advantages = advantages[process_slice]
+            all_rewards_per_func.append(rewards_per_func)
+            all_advantages.append(advantages)
 
             # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-            for i, reward_func_name in enumerate(self.reward_func_names):
+            reward_func_names = self.reward_func_names_correctness if adapter_name == "default" else self.reward_func_names_diversity
+            for i, reward_func_name in enumerate(reward_func_names):
                 mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+                self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_rewards)
                 std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-            self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-            self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-            self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+                self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
 
-            # Log prompt and completion texts
-            self._logs["prompt"].extend(gather_object(self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)))
-            self._logs["completion"].extend(gather_object(completions_text))
-            for i, name in enumerate(self.reward_func_names):
-                self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-            self._logs["advantages"].extend(all_process_advantages.tolist())
+            start_index = end_index
+
+        all_advantages = torch.cat(all_advantages, dim=0)
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts_text),
+            (self.accelerator.process_index + 1) * len(prompts_text),
+        )
+        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+        advantages = all_advantages[process_slice]
+
+        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # breakpoint()
+        # Log prompt and completion texts
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        # breakpoint()
+        for i, name in enumerate(reward_func_names):
+            log_key = f"{adapter_name}/{name}"
+            # breakpoint()
+            if log_key not in self._logs["rewards"]:
+                self._logs["rewards"][name] = []
+                # breakpoint()
+            self._logs["rewards"][log_key].extend(rewards_per_func[:, i].tolist())
+        self._logs["advantages"].extend(all_process_advantages.tolist())
 
 
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-                delta = delta[completion_mask.bool()]
-                mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                    self.accelerator.gather(mean_delta).mean().item()
-                )
-                self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                    self.accelerator.gather(max_delta).max().item()
-                )
+        if self.use_vllm and self.vllm_importance_sampling_correction:
 
-                flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
-                min_importance_sampling_ratio = (
-                    torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                )
-                mean_importance_sampling_ratio = (
-                    torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                )
-                max_importance_sampling_ratio = (
-                    torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                )
-                self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                    nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-                )
-                self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                    self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-                )
-                self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                    nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-                )
+            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
+            importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
+            importance_sampling_ratio = torch.clamp(
+                importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+            )            
 
-            inputs[i]["advantages"] = advantages
-            total_outputs = self._generate_completions.total_outputs
-            total_outputs["advantages"] = advantages
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+            delta = delta[completion_mask.bool()]
+            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                self.accelerator.gather(mean_delta).mean().item()
+            )
+            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                self.accelerator.gather(max_delta).max().item()
+            )
 
-            return total_outputs
+            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
+            min_importance_sampling_ratio = (
+                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            mean_importance_sampling_ratio = (
+                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            max_importance_sampling_ratio = (
+                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+            )
+
+        breakpoint()
+        generation_batch["advantages"] = advantages
+        
+        return generation_batch
 
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1938,16 +2084,34 @@ class ValSETrainer(GRPOTrainer):
 
 
     def _compute_loss(self, model, inputs):
+        device = self.accelerator.device
+        mode = "train" if model.training else "eval"
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        advantages = inputs["advantages"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        for _adapter in self.adapter_name:
-            self.model.set_adapter(_adapter)
-            print(f"  >> [Loss Computation] Using adapter: {_adapter}")
+        adapter_names = inputs["adapter_info"]["adapter_names"]
+        num_generations_list = inputs["adapter_info"]["num_generations_per_adapter"]
+
+        total_loss = 0.0
+        start_index = 0
+
+        for adapter_name, num_generations in zip(adapter_names, num_generations_list):
+            self.model.set_adapter(adapter_name)
+            print(f"  >> [Loss Computation] Using adapter: {adapter_name}")
+
+            batch_size = prompt_ids.size(0) // self.total_num_generations
+            end_index = start_index + num_generations * batch_size
+
+            cur_input_ids = input_ids[start_index:end_index]
+            cur_attention_mask = attention_mask[start_index:end_index]
+            cur_completion_mask = completion_mask[start_index:end_index]
+            cur_advantages = advantages[start_index:end_index]
 
             # Compute the per_token_logps and the entropy at each position in the completion
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -1977,7 +2141,6 @@ class ValSETrainer(GRPOTrainer):
                 )
 
             # Compute the loss
-            advantages = inputs["advantages"]
             # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
             # old_per_token_logps == per_token_logps. In this case we can skip its computation
             # (see _generate_and_score_completions) and instead use per_token_logps.detach().
@@ -2010,6 +2173,7 @@ class ValSETrainer(GRPOTrainer):
             per_token_loss1 = coef_1 * advantages.unsqueeze(1)
             per_token_loss2 = coef_2 * advantages.unsqueeze(1)
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
             if entropy_mask is not None:
                 per_token_loss = per_token_loss * entropy_mask
 
@@ -2034,8 +2198,7 @@ class ValSETrainer(GRPOTrainer):
             else:
                 raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-            # Log the metrics
-            mode = "train" if self.model.training else "eval"
+            total_loss += loss
 
             completion_token_count = completion_mask.sum().clamp(min=1.0)
 
@@ -2070,7 +2233,11 @@ class ValSETrainer(GRPOTrainer):
             gathered_clip_ratio = self.accelerator.gather(clip_ratio)
             self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
 
-        return loss
+            start_index = end_index
+
+        total_loss = total_loss / self.current_gradient_accumulation_steps
+
+        return total_loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         inputs = self._prepare_inputs(inputs)
