@@ -1290,15 +1290,22 @@ class ValSETrainer(BaseTrainer):
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
                     adapter_data = {}
                     for key, value in scored_outputs.items():
-                        if key in ["adapter_info", "num_items_in_batch"]:
+                        total_size = sum(e - s for s, e in adapter_boundaries)
+                        if key in ["adapter_info", "num_items_in_batch", "all_extra_fields"]:
                             # Skip metadata - will add back later
                             continue
                         elif isinstance(value, torch.Tensor):
                             # Check if this tensor has a batch dimension matching total completions
-                            if value.size(0) == sum(e - s for s, e in adapter_boundaries):
+                            if value.size(0) == total_size:
                                 adapter_data[key] = value[start_index:end_index]
                             else:
                                 # Keep as-is (e.g., scalar or different shape)
+                                adapter_data[key] = value
+
+                        elif isinstance(value, list):
+                            if len(value) == total_size:
+                                adapter_data[key] = value[start_index:end_index]
+                            else:
                                 adapter_data[key] = value
                         else:
                             # Non-tensor values
@@ -1334,7 +1341,7 @@ class ValSETrainer(BaseTrainer):
                         # Add back metadata
                         batch.update(adapter_metadata)
                         splits_with_metadata.append(batch)
-                    processed_batches.append(splits)
+                    processed_batches.append(splits_with_metadata)
                 
                 self._buffered_inputs = []
                 for step_idx in range(self.args.steps_per_generation):
@@ -1856,14 +1863,13 @@ class ValSETrainer(BaseTrainer):
             
             # Repeat each prompt 'num_generations' times for the current adapter
             # batch_size = len(inputs)
-            prompts = [x["prompt"] for x in inputs[:num_generation]]
-            # breakpoint()
-            assert len(prompts) == self.num_generations_per_adapter[0]
+            prompts = [x["prompt"] for x in inputs]
+            breakpoint()
 
             prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                self._generate(prompts)
+                self._generate(prompts[self.num_generations_per_adapter[adapter_index-1]:self.num_generations_per_adapter[adapter_index]])
             )
-            # breakpoint()
+            breakpoint()
             """
             (Pdb) len(completion_ids_list[0])
             412
@@ -1875,6 +1881,7 @@ class ValSETrainer(BaseTrainer):
             end_index = current_adapter + len(prompt_ids_list)
             adapter_boundaries.append((start_index, end_index))
             current_adapter = end_index
+            breakpoint()
 
             all_prompt_ids_list.extend(prompt_ids_list)
             all_completion_ids_list.extend(completion_ids_list)
@@ -1882,7 +1889,8 @@ class ValSETrainer(BaseTrainer):
                 all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
             all_extra_fields_list.append(extra_fields)
             total_num_items += num_items_in_batch
-            # breakpoint()
+            breakpoint()
+            print(f"  >> [Rollout] Generated a total of {total_num_items} completion tokens. | Adapter boundaries: {adapter_boundaries} | Adapter names: {self.adapter_names}")
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids_list]
@@ -2067,16 +2075,17 @@ class ValSETrainer(BaseTrainer):
         start_index = 0
         for adapter_index, (adapter_name, num_generation, (start_index, end_index)) in enumerate(zip(adapter_names, num_generations_list, adapter_boundaries)):
             # breakpoint()
-            end_index = start_index + len(prompts_text) * num_generation
-            # breakpoint()
+            end_index = start_index + len(prompts_text) 
+            assert len(prompts_text) == num_generation
+            breakpoint()
 
             curr_prompts = prompts_text[start_index:end_index]
             curr_completions = [completions[i] for i in range(start_index, end_index)]
             curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
-            # breakpoint()
+            breakpoint()
 
             generated_num_samples = end_index - start_index
-            assert generated_num_samples == len(prompts_text) * num_generation, \
+            assert generated_num_samples == len(prompts_text), \
                 f"Generated samples ({generated_num_samples}) do not match expected ({len(prompts_text) * num_generation})"
 
             logger.info(
@@ -2125,7 +2134,7 @@ class ValSETrainer(BaseTrainer):
                 curr_num_generations = self.num_generations_per_adapter[adapter_index]
             else:
                 raise ValueError(f"Unknown adapter name: {adapter_name}")
-            # breakpoint()
+            breakpoint()
 
             # Apply weights to each reward function's output and sum
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
@@ -2157,6 +2166,7 @@ class ValSETrainer(BaseTrainer):
 
             all_rewards_per_func.append(rewards_per_func)
             all_advantages.append(advantages)
+            breakpoint()
 
             # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
             # reward_func_names = self.reward_func_names_correctness if adapter_name == "default" else self.reward_func_names_diversity
@@ -2167,6 +2177,7 @@ class ValSETrainer(BaseTrainer):
                 self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
 
             start_index = end_index
+            breakpoint()
 
         all_advantages = torch.cat(all_advantages, dim=0)
 
@@ -2236,7 +2247,7 @@ class ValSETrainer(BaseTrainer):
                 nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
             )
 
-        # breakpoint()
+        breakpoint()
         generation_batch["advantages"] = advantages
         
         return generation_batch
