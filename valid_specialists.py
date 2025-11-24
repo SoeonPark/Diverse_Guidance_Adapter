@@ -1693,11 +1693,20 @@ class ValSETrainer(BaseTrainer):
             print(f"  >> [Rollout] Generating {num_generations} completions using adapter '{adapter_name}'")
             
             # Repeat each prompt 'num_generations' times for the current adapter
-            prompts = [x["prompt"] for x in inputs] * num_generations
+            prompts = [x["prompt"] for x in inputs[:num_generations]]
+            # breakpoint()
+            assert len(prompts) == len(inputs[:num_generations])
 
             prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
                 self._generate(prompts)
             )
+            breakpoint()
+            """
+            (Pdb) len(completion_ids_list[0])
+            412
+            (Pdb) num_items_in_batch
+            tensor(412, device='cuda:0')
+            """
 
             all_prompt_ids_list.extend(prompt_ids_list)
             all_completion_ids_list.extend(completion_ids_list)
@@ -1705,17 +1714,28 @@ class ValSETrainer(BaseTrainer):
                 all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
             all_extra_fields_list.append(extra_fields)
             total_num_items += num_items_in_batch
+            breakpoint()
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+        breakpoint()
+        """
+        (Pdb) prompt_ids.shape
+        torch.Size([1, 106])
+        """
 
         completion_ids = [torch.tensor(ids, device=device) for ids in all_completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
         completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+        breakpoint()
+        """
+        (Pdb) completion_ids.shape
+        torch.Size([1, 412])
+        """
 
         if all_sampling_per_token_logps_list:
             sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in all_sampling_per_token_logps_list]
