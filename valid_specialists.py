@@ -691,110 +691,185 @@ class ValSETrainer(BaseTrainer):
                 loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
                 return loss_mb.reduce_mean().detach().to(self.args.device)
 
-            adapter_names = inputs["adapter_info"]["adapter_names"]
-            num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
+            # adapter_names = inputs["adapter_info"]["adapter_names"]
+            # num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
 
             total_loss = 0.0
 
-            for adapter_index, (adapter_name, num_generation) in enumerate(zip(adapter_names, num_generations_per_adapter)):
-                model.set_adapter(adapter_name)
-                
-                adapter_inputs = self._slice_inputs_for_adapter(inputs, adapter_index)
+            adapter_batches = inputs.get("adapter_batches")
 
+            # For the case 'inference mode' oronly use one adapter
+            if adapter_batches is None:
                 with self.compute_loss_context_manager():
-                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
-                if (
-                    self.args.torch_empty_cache_steps is not None
-                    and self.state.global_step % self.args.torch_empty_cache_steps == 0
-                ):
-                    if is_torch_xpu_available():
-                        torch.xpu.empty_cache()
-                    elif is_torch_mlu_available():
-                        torch.mlu.empty_cache()
-                    elif is_torch_musa_available():
-                        torch.musa.empty_cache()
-                    elif is_torch_npu_available():
-                        torch.npu.empty_cache()
-                    elif is_torch_mps_available():
-                        torch.mps.empty_cache()
-                    elif is_torch_hpu_available():
-                        logger.warning(
-                            "`torch_empty_cache_steps` is set but HPU device/backend does not support empty_cache()."
-                        )
-                    else:
-                        torch.cuda.empty_cache()
-
-                kwargs = {}
-
-                # For LOMO optimizers you need to explicitly use the learning rate
-                if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-                    kwargs["learning_rate"] = self._get_learning_rate()
-
+                    loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
                 if self.args.n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-                if self.use_apex:
-                    from apex import amp
+                if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+                    loss = loss / self.current_gradient_accumulation_steps
 
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
-                    if (
-                        not self.model_accepts_loss_kwargs or num_items_in_batch is None
-                    ) and self.compute_loss_func is None:
-                        # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
-                        loss = loss / self.current_gradient_accumulation_steps
+                kwargs = {}
+                if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                    kwargs["learning_rate"] = self._get_learning_rate()
 
-                    # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
-                    # https://github.com/huggingface/transformers/pull/35808
+                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                    kwargs["scale_wrt_gas"] = False
+                
+                self.accelerator.backward(loss, **kwargs)
+                total_loss = loss.detach()
+
+            else:
+                # For the case 'training mode' with MULTIPLE adapters
+                for adapter_index, adapter_inputs in enumerate(adapter_batches):
+                    adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
+                    
+                    # Set adapter
+                    if is_peft_available() and isinstance(model, PeftModel):
+                        model.set_adapter(adapter_name)
+                    
+                    print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
+                    
+                    # Forward & Backward
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+                    
+                    if self.args.n_gpu > 1:
+                        loss = loss.mean()
+                    
+                    # Normalize loss
+                    if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+                        if self.compute_loss_func is None:
+                            loss = loss / self.current_gradient_accumulation_steps
+                    
+                    kwargs = {}
+                    if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                        kwargs["learning_rate"] = self._get_learning_rate()
+                    
                     if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                         kwargs["scale_wrt_gas"] = False
-
+                    
+                    # Backward
                     self.accelerator.backward(loss, **kwargs)
-                
-                total_loss += loss.detach()
-
-                del adapter_inputs
-
-                return total_loss
+                    
+                    total_loss += loss.detach()
+                    
+                    del adapter_inputs
+                    if self.args.torch_empty_cache_steps is not None:
+                        if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
+                            if is_torch_xpu_available():
+                                torch.xpu.empty_cache()
+                            elif is_torch_mlu_available():
+                                torch.mlu.empty_cache()
+                            elif is_torch_musa_available():
+                                torch.musa.empty_cache()
+                            elif is_torch_npu_available():
+                                torch.npu.empty_cache()
+                            elif is_torch_mps_available():
+                                torch.mps.empty_cache()
+                            else:
+                                torch.cuda.empty_cache()
             
-    def _slice_inputs_for_adapter(
-        self,
-        inputs: dict[str, Union[torch.Tensor, Any]],
-        adapter_index: int,
-    ) -> dict[str, Union[torch.Tensor, Any]]:
-        adapter_names = inputs["adapter_info"]["adapter_names"]
-        num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
-        adapter_boundaries = inputs["adapter_info"]["adapter_boundaries"]
+            return total_loss
 
-        batch_size = inputs["prompt"].size(0)
-        # start_index = sum(num_generations_per_adapter[:adapter_index]) * batch_size
-        # end_index = start_index + num_generations_per_adapter[adapter_index] * batch_size
-        start_index, end_index = adapter_boundaries[adapter_index]
+            # for adapter_index, (adapter_name, num_generation) in enumerate(zip(adapter_names, num_generations_per_adapter)):
+            #     model.set_adapter(adapter_name)
+                
+            #     adapter_inputs = self._slice_inputs_for_adapter(inputs, adapter_index)
 
-        adapter_inputs = {}
+            #     with self.compute_loss_context_manager():
+            #         loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
-        for key in ["prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "advantages"]:
-            if key in inputs and inputs[key] is not None:
-                adapter_inputs[key] = inputs[key][start_index:end_index]
+            #     if (
+            #         self.args.torch_empty_cache_steps is not None
+            #         and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            #     ):
+            #         if is_torch_xpu_available():
+            #             torch.xpu.empty_cache()
+            #         elif is_torch_mlu_available():
+            #             torch.mlu.empty_cache()
+            #         elif is_torch_musa_available():
+            #             torch.musa.empty_cache()
+            #         elif is_torch_npu_available():
+            #             torch.npu.empty_cache()
+            #         elif is_torch_mps_available():
+            #             torch.mps.empty_cache()
+            #         elif is_torch_hpu_available():
+            #             logger.warning(
+            #                 "`torch_empty_cache_steps` is set but HPU device/backend does not support empty_cache()."
+            #             )
+            #         else:
+            #             torch.cuda.empty_cache()
 
-        for key in ["old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps", 
-                    "importance_sampling_ratio", "token_type_ids"]:
-            if key in inputs and inputs[key] is not None:
-                adapter_inputs[key] = inputs[key][start_index:end_index]
+            #     kwargs = {}
 
-        for key in ["adapter_info", "num_items_in_batch"]:
-            if key in inputs:
-                adapter_inputs[key] = inputs[key]
+            #     # For LOMO optimizers you need to explicitly use the learning rate
+            #     if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            #         kwargs["learning_rate"] = self._get_learning_rate()
 
-        adapter_inputs["adapter_info"] = {
-            "adapter_names": [adapter_names[adapter_index]],
-            "num_generations_per_adapter": [num_generations_per_adapter[adapter_index]],
-        }
+            #     if self.args.n_gpu > 1:
+            #         loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        return adapter_inputs
+            #     if self.use_apex:
+            #         from apex import amp
+
+            #         with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+            #             scaled_loss.backward()
+            #     else:
+            #         # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
+            #         if (
+            #             not self.model_accepts_loss_kwargs or num_items_in_batch is None
+            #         ) and self.compute_loss_func is None:
+            #             # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
+            #             loss = loss / self.current_gradient_accumulation_steps
+
+            #         # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
+            #         # https://github.com/huggingface/transformers/pull/35808
+            #         if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            #             kwargs["scale_wrt_gas"] = False
+
+            #         self.accelerator.backward(loss, **kwargs)
+                
+            #     total_loss += loss.detach()
+
+            #     del adapter_inputs
+
+            #     return total_loss
+            
+    # def _slice_inputs_for_adapter(
+    #     self,
+    #     inputs: dict[str, Union[torch.Tensor, Any]],
+    #     adapter_index: int,
+    # ) -> dict[str, Union[torch.Tensor, Any]]:
+    #     adapter_names = inputs["adapter_info"]["adapter_names"]
+    #     num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
+    #     adapter_boundaries = inputs["adapter_info"]["adapter_boundaries"]
+
+    #     batch_size = inputs["prompt"].size(0)
+    #     # start_index = sum(num_generations_per_adapter[:adapter_index]) * batch_size
+    #     # end_index = start_index + num_generations_per_adapter[adapter_index] * batch_size
+    #     start_index, end_index = adapter_boundaries[adapter_index]
+
+    #     adapter_inputs = {}
+
+    #     for key in ["prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "advantages"]:
+    #         if key in inputs and inputs[key] is not None:
+    #             adapter_inputs[key] = inputs[key][start_index:end_index]
+
+    #     for key in ["old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps", 
+    #                 "importance_sampling_ratio", "token_type_ids"]:
+    #         if key in inputs and inputs[key] is not None:
+    #             adapter_inputs[key] = inputs[key][start_index:end_index]
+
+    #     for key in ["adapter_info", "num_items_in_batch"]:
+    #         if key in inputs:
+    #             adapter_inputs[key] = inputs[key]
+
+    #     adapter_inputs["adapter_info"] = {
+    #         "adapter_names": [adapter_names[adapter_index]],
+    #         "num_generations_per_adapter": [num_generations_per_adapter[adapter_index]],
+    #     }
+
+    #     return adapter_inputs
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -992,6 +1067,7 @@ class ValSETrainer(BaseTrainer):
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
+        breakpoint()
         for start in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
@@ -1201,16 +1277,72 @@ class ValSETrainer(BaseTrainer):
                 (Pdb) scored_outputs.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'num_items_in_batch', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'adapter_info', 'advantages'])
                 """
+
+                adapter_info = scored_outputs["adapter_info"]
+                adapter_boundaries = adapter_info["adapter_boundaries"]
+                num_items_in_batch = scored_outputs["num_items_in_batch"]
                 scored_outputs = split_pixel_values_by_grid(scored_outputs)
-                breakpoint()
 
-                metadata = {}
-                metadata["num_items_in_batch"] = scored_outputs.pop("num_items_in_batch", None)
-                metadata["all_extra_fields"] = scored_outputs.pop("all_extra_fields", None)
+                adapter_batches = []
 
-                scored_outputs = shuffle_sequence_dict(scored_outputs)
-                scored_outputs = split_tensor_dict(scored_outputs, self.args.steps_per_generation)
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in scored_outputs]
+                # breakpoint()
+
+                for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
+                    adapter_data = {}
+                    for key, value in scored_outputs.items():
+                        if key in ["adapter_info", "num_items_in_batch"]:
+                            # Skip metadata - will add back later
+                            continue
+                        elif isinstance(value, torch.Tensor):
+                            # Check if this tensor has a batch dimension matching total completions
+                            if value.size(0) == sum(e - s for s, e in adapter_boundaries):
+                                adapter_data[key] = value[start_index:end_index]
+                            else:
+                                # Keep as-is (e.g., scalar or different shape)
+                                adapter_data[key] = value
+                        else:
+                            # Non-tensor values
+                            adapter_data[key] = value
+                            
+                    adapter_metadata = {
+                        "adapter_info": {
+                            "adapter_names": [adapter_info["adapter_names"][adapter_index]],
+                            "num_generations_per_adapter": [adapter_info["num_generations_per_adapter"][adapter_index]],
+                            "adapter_boundaries": [(0, end_index - start_index)],
+                        },
+                        "num_items_in_batch": num_items_in_batch
+                    }
+                    
+                    adapter_batches.append((adapter_data, adapter_metadata))
+                # breakpoint()
+                
+                processed_batches = []
+                for adapter_data, adapter_metadata in adapter_batches:
+                    # adapter_data = split_pixel_values_by_grid(adapter_data)
+                    # breakpoint()
+                    adapter_data = shuffle_sequence_dict(adapter_data)
+                    """
+                    (Pdb) adapter_data.keys()
+                    dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'advantages'])
+                    """
+                    splits = split_tensor_dict(adapter_data, self.args.steps_per_generation)
+                    
+                    # Unsplit each piece
+                    splits_with_metadata = []
+                    for batch in splits:
+                        batch = unsplit_pixel_values_by_grid(batch)
+                        # Add back metadata
+                        batch.update(adapter_metadata)
+                        splits_with_metadata.append(batch)
+                    processed_batches.append(splits)
+                
+                self._buffered_inputs = []
+                for step_idx in range(self.args.steps_per_generation):
+                    step_batch = {
+                        "adapter_batches": [batches[step_idx] for batches in processed_batches],
+                    }
+                    self._buffered_inputs.append(step_batch)
+                    
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
             self._step += 1
         else:
@@ -2171,150 +2303,135 @@ class ValSETrainer(BaseTrainer):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        advantages = inputs["advantages"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        adapter_names = inputs["adapter_info"]["adapter_names"]
-        num_generations_list = inputs["adapter_info"]["num_generations_per_adapter"]
+        adapter_name = inputs["adapter_info"]["adapter_names"][0]
+        print(f"  >> [Loss Computation] Computing loss for adapter: {adapter_name}")
 
-        total_loss = 0.0
-        start_index = 0
+        # Compute the per_token_logps and the entropy at each position in the completion
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            compute_entropy=True,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            num_images=inputs.get("num_images"),
+            pixel_attention_mask=inputs.get("pixel_attention_mask"),
+            image_sizes=inputs.get("image_sizes"),
+            token_type_ids=inputs.get("token_type_ids"),
+        )
 
-        for adapter_name, num_generations in zip(adapter_names, num_generations_list):
-            self.model.set_adapter(adapter_name)
-            print(f"  >> [Loss Computation] Using adapter: {adapter_name}")
+        if self.top_entropy_quantile < 1.0:
+            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
+        else:
+            entropy_mask = None
 
-            batch_size = prompt_ids.size(0) // self.total_num_generations
-            end_index = start_index + num_generations * batch_size
-
-            cur_input_ids = input_ids[start_index:end_index]
-            cur_attention_mask = attention_mask[start_index:end_index]
-            cur_completion_mask = completion_mask[start_index:end_index]
-            cur_advantages = advantages[start_index:end_index]
-
-            # Compute the per_token_logps and the entropy at each position in the completion
-            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-                model,
-                cur_input_ids,
-                cur_attention_mask,
-                logits_to_keep,
-                compute_entropy=True,
-                pixel_values=inputs.get("pixel_values"),
-                image_grid_thw=inputs.get("image_grid_thw"),
-                num_images=inputs.get("num_images"),
-                pixel_attention_mask=inputs.get("pixel_attention_mask"),
-                image_sizes=inputs.get("image_sizes"),
-                token_type_ids=inputs.get("token_type_ids"),
+        # Compute the KL divergence between the model and the reference model
+        if self.beta != 0.0:
+            ref_per_token_logps = inputs["ref_per_token_logps"]
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
 
-            if self.top_entropy_quantile < 1.0:
-                entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
+        # Compute the loss
+        advantages = inputs["advantages"]
+        # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
+        # old_per_token_logps == per_token_logps. In this case we can skip its computation
+        # (see _generate_and_score_completions) and instead use per_token_logps.detach().
+        # The exception is when using vLLM, where we always compute old_per_token_logps
+        # for importance sampling
+        old_per_token_logps = inputs.get("old_per_token_logps")
+        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+
+        log_ratio = per_token_logps - old_per_token_logps
+        if self.importance_sampling_level == "token":
+            log_importance_weights = log_ratio
+        elif self.importance_sampling_level == "sequence":
+            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            log_importance_weights = log_importance_weights.unsqueeze(-1)
+        else:
+            raise ValueError(
+                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
+                "and 'sequence'."
+            )
+        # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
+        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+
+        coef_1 = torch.exp(log_importance_weights)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+        # Two-sided clipping
+        if self.args.delta is not None:
+            coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        if entropy_mask is not None:
+            per_token_loss = per_token_loss * entropy_mask
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        if self.loss_type == "grpo":
+            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "bnpo":
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "dr_grpo":
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type == "dapo":
+            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+            loss = (per_token_loss * completion_mask).sum() / normalizer
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        total_loss += loss
+
+        completion_token_count = completion_mask.sum().clamp(min=1.0)
+
+        def masked_batch_mean(x):
+            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+                return x.mean()
             else:
-                entropy_mask = None
+                return (x * completion_mask).sum() / completion_token_count
 
-            # Compute the KL divergence between the model and the reference model
-            if self.beta != 0.0:
-                cur_ref_logps = inputs["ref_per_token_logps"][start_index:end_index]
-                per_token_kl = (
-                    torch.exp(cur_ref_logps - per_token_logps) - (cur_ref_logps - per_token_logps) - 1
-                )
+        if self.beta != 0.0:
+            mean_kl = masked_batch_mean(per_token_kl)
+            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
 
-            # Compute the loss
-            # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
-            # old_per_token_logps == per_token_logps. In this case we can skip its computation
-            # (see _generate_and_score_completions) and instead use per_token_logps.detach().
-            # The exception is when using vLLM, where we always compute old_per_token_logps
-            # for importance sampling
-            old_per_token_logps = inputs.get("old_per_token_logps")
-            old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+        mean_entropy = masked_batch_mean(entropies)
+        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
-            log_ratio = per_token_logps - old_per_token_logps
-            if self.importance_sampling_level == "token":
-                log_importance_weights = log_ratio
-            elif self.importance_sampling_level == "sequence":
-                log_importance_weights = (log_ratio * cur_completion_mask).sum(-1) / cur_completion_mask.sum(-1).clamp(min=1.0)
-                log_importance_weights = log_importance_weights.unsqueeze(-1)
-            else:
-                raise ValueError(
-                    f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                    "and 'sequence'."
-                )
-            # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-            # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+        # Compute the clipped probability ratios
+        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_region_clipped = is_low_clipped | is_high_clipped
 
-            coef_1 = torch.exp(log_importance_weights)
-            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+        low_clip = masked_batch_mean(is_low_clipped.float())
+        high_clip = masked_batch_mean(is_high_clipped.float())
+        clip_ratio = masked_batch_mean(is_region_clipped.float())
 
-            # Two-sided clipping
-            if self.args.delta is not None:
-                coef_1 = torch.clamp(coef_1, max=self.args.delta)
+        gathered_low_clip = self.accelerator.gather(low_clip)
+        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
+        gathered_high_clip = self.accelerator.gather(high_clip)
+        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
+        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
 
-            per_token_loss1 = coef_1 * cur_advantages.unsqueeze(1)
-            per_token_loss2 = coef_2 * cur_advantages.unsqueeze(1)
-            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-
-            if entropy_mask is not None:
-                per_token_loss = per_token_loss * entropy_mask
-
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
-
-            if self.beta != 0.0:
-                per_token_loss = per_token_loss + self.beta * per_token_kl
-
-            if self.loss_type == "grpo":
-                loss = ((per_token_loss * cur_completion_mask).sum(-1) / cur_completion_mask.sum(-1).clamp(min=1.0)).mean()
-                loss = loss / self.current_gradient_accumulation_steps
-            elif self.loss_type == "bnpo":
-                loss = (per_token_loss * cur_completion_mask).sum() / cur_completion_mask.sum().clamp(min=1.0)
-                loss = loss / self.current_gradient_accumulation_steps
-            elif self.loss_type == "dr_grpo":
-                loss = (per_token_loss * cur_completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-                loss = loss / self.current_gradient_accumulation_steps
-            elif self.loss_type == "dapo":
-                normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-                loss = (per_token_loss * cur_completion_mask).sum() / normalizer
-            else:
-                raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-            total_loss += loss
-
-            completion_token_count = cur_completion_mask.sum().clamp(min=1.0)
-
-            def masked_batch_mean(x):
-                if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                    return x.mean()
-                else:
-                    return (x * cur_completion_mask).sum() / completion_token_count
-
-            if self.beta != 0.0:
-                mean_kl = masked_batch_mean(per_token_kl)
-                self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
-
-            mean_entropy = masked_batch_mean(entropies)
-            self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-            # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (cur_advantages.unsqueeze(1) < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (cur_advantages.unsqueeze(1) > 0)
-            is_region_clipped = is_low_clipped | is_high_clipped
-
-            low_clip = masked_batch_mean(is_low_clipped.float())
-            high_clip = masked_batch_mean(is_high_clipped.float())
-            clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-            gathered_low_clip = self.accelerator.gather(low_clip)
-            self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-            self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-            gathered_high_clip = self.accelerator.gather(high_clip)
-            self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-            self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-            gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-            self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-
-            start_index = end_index
+        # start_index = end_index
 
         total_loss = total_loss / self.current_gradient_accumulation_steps
 
