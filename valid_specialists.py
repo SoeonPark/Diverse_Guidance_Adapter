@@ -1196,13 +1196,18 @@ class ValSETrainer(BaseTrainer):
                 generation_batch = self._generate_completions(generation_batch)
                 # breakpoint()
                 scored_outputs = self._score_completions(original_inputs, generation_batch)
-                breakpoint()
+                # breakpoint()
                 """
                 (Pdb) scored_outputs.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'num_items_in_batch', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'adapter_info', 'advantages'])
                 """
                 scored_outputs = split_pixel_values_by_grid(scored_outputs)
                 breakpoint()
+
+                metadata = {}
+                metadata["num_items_in_batch"] = scored_outputs.pop("num_items_in_batch", None)
+                metadata["all_extra_fields"] = scored_outputs.pop("all_extra_fields", None)
+
                 scored_outputs = shuffle_sequence_dict(scored_outputs)
                 scored_outputs = split_tensor_dict(scored_outputs, self.args.steps_per_generation)
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in scored_outputs]
@@ -1258,7 +1263,7 @@ class ValSETrainer(BaseTrainer):
             # zip(self.reward_funcs_correctness, self.reward_processing_classes, self.reward_func_names_correctness)
             zip(self.reward_funcs_correctness, self.reward_processing_classes, self.reward_func_names_correctness)
         ):
-            breakpoint()
+            # breakpoint()
             with profiling_context(self, f"reward_func_correctness.{reward_func_name}"):
                 if isinstance(reward_func, nn.Module): # Module (no PretrainedModel) for compat with compiled models
                     if is_conversational(inputs[0]):
@@ -1269,7 +1274,7 @@ class ValSETrainer(BaseTrainer):
                         ]
                     else:
                         texts = [p + c for p, c in zip(prompts, completions)]
-                    breakpoint()
+                    # breakpoint()
                     reward_inputs = reward_processing_class(
                         texts=texts,
                         return_tensors="pt",
@@ -1280,7 +1285,7 @@ class ValSETrainer(BaseTrainer):
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-                    breakpoint()
+                    # breakpoint()
                 else:
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
@@ -1302,7 +1307,7 @@ class ValSETrainer(BaseTrainer):
                 f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
                 "Please ensure that at least one reward function returns a valid reward."
             )
-        breakpoint()
+        # breakpoint()
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
@@ -1726,7 +1731,7 @@ class ValSETrainer(BaseTrainer):
             prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
                 self._generate(prompts)
             )
-            breakpoint()
+            # breakpoint()
             """
             (Pdb) len(completion_ids_list[0])
             412
@@ -1745,14 +1750,14 @@ class ValSETrainer(BaseTrainer):
                 all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
             all_extra_fields_list.append(extra_fields)
             total_num_items += num_items_in_batch
-            breakpoint()
+            # breakpoint()
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
-        breakpoint()
+        # breakpoint()
         """
         (Pdb) prompt_ids.shape
         torch.Size([1, 106])
@@ -1762,7 +1767,7 @@ class ValSETrainer(BaseTrainer):
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
         completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
-        breakpoint()
+        # breakpoint()
         """
         (Pdb) completion_ids.shape
         torch.Size([1, 412])
@@ -1988,7 +1993,7 @@ class ValSETrainer(BaseTrainer):
                 curr_num_generations = self.num_generations_per_adapter[adapter_index]
             else:
                 raise ValueError(f"Unknown adapter name: {adapter_name}")
-            breakpoint()
+            # breakpoint()
 
             # Apply weights to each reward function's output and sum
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
@@ -2192,8 +2197,8 @@ class ValSETrainer(BaseTrainer):
             # Compute the per_token_logps and the entropy at each position in the completion
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
                 model,
-                input_ids,
-                attention_mask,
+                cur_input_ids,
+                cur_attention_mask,
                 logits_to_keep,
                 compute_entropy=True,
                 pixel_values=inputs.get("pixel_values"),
@@ -2211,9 +2216,9 @@ class ValSETrainer(BaseTrainer):
 
             # Compute the KL divergence between the model and the reference model
             if self.beta != 0.0:
-                ref_per_token_logps = inputs["ref_per_token_logps"]
+                cur_ref_logps = inputs["ref_per_token_logps"][start_index:end_index]
                 per_token_kl = (
-                    torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                    torch.exp(cur_ref_logps - per_token_logps) - (cur_ref_logps - per_token_logps) - 1
                 )
 
             # Compute the loss
@@ -2229,7 +2234,7 @@ class ValSETrainer(BaseTrainer):
             if self.importance_sampling_level == "token":
                 log_importance_weights = log_ratio
             elif self.importance_sampling_level == "sequence":
-                log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+                log_importance_weights = (log_ratio * cur_completion_mask).sum(-1) / cur_completion_mask.sum(-1).clamp(min=1.0)
                 log_importance_weights = log_importance_weights.unsqueeze(-1)
             else:
                 raise ValueError(
@@ -2246,8 +2251,8 @@ class ValSETrainer(BaseTrainer):
             if self.args.delta is not None:
                 coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss1 = coef_1 * cur_advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * cur_advantages.unsqueeze(1)
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
             if entropy_mask is not None:
@@ -2260,29 +2265,29 @@ class ValSETrainer(BaseTrainer):
                 per_token_loss = per_token_loss + self.beta * per_token_kl
 
             if self.loss_type == "grpo":
-                loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+                loss = ((per_token_loss * cur_completion_mask).sum(-1) / cur_completion_mask.sum(-1).clamp(min=1.0)).mean()
                 loss = loss / self.current_gradient_accumulation_steps
             elif self.loss_type == "bnpo":
-                loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                loss = (per_token_loss * cur_completion_mask).sum() / cur_completion_mask.sum().clamp(min=1.0)
                 loss = loss / self.current_gradient_accumulation_steps
             elif self.loss_type == "dr_grpo":
-                loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+                loss = (per_token_loss * cur_completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
                 loss = loss / self.current_gradient_accumulation_steps
             elif self.loss_type == "dapo":
                 normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-                loss = (per_token_loss * completion_mask).sum() / normalizer
+                loss = (per_token_loss * cur_completion_mask).sum() / normalizer
             else:
                 raise ValueError(f"Unknown loss type: {self.loss_type}")
 
             total_loss += loss
 
-            completion_token_count = completion_mask.sum().clamp(min=1.0)
+            completion_token_count = cur_completion_mask.sum().clamp(min=1.0)
 
             def masked_batch_mean(x):
                 if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                     return x.mean()
                 else:
-                    return (x * completion_mask).sum() / completion_token_count
+                    return (x * cur_completion_mask).sum() / completion_token_count
 
             if self.beta != 0.0:
                 mean_kl = masked_batch_mean(per_token_kl)
@@ -2292,8 +2297,8 @@ class ValSETrainer(BaseTrainer):
             self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
             # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (cur_advantages.unsqueeze(1) < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (cur_advantages.unsqueeze(1) > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
 
             low_clip = masked_batch_mean(is_low_clipped.float())
