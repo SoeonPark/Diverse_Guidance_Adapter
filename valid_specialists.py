@@ -750,6 +750,7 @@ class ValSETrainer(BaseTrainer):
             else:
                 # For the case 'training mode' with MULTIPLE adapters
                 for adapter_index, adapter_inputs in enumerate(adapter_batches):
+
                     adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
                     
                     # Set adapter
@@ -760,6 +761,7 @@ class ValSETrainer(BaseTrainer):
                     
                     # Forward & Backward
                     with self.compute_loss_context_manager():
+                        breakpoint()
                         loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
                     if self.args.n_gpu > 1:
@@ -1096,8 +1098,9 @@ class ValSETrainer(BaseTrainer):
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
-        # breakpoint()
+        breakpoint()
         for start in range(0, input_ids.size(0), batch_size):
+            # breakpoint()
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
 
@@ -1299,9 +1302,9 @@ class ValSETrainer(BaseTrainer):
                 original_inputs = generation_batch
                 # breakpoint()
                 generation_batch = self._generate_completions(generation_batch)
-                breakpoint()
+                # breakpoint()
                 scored_outputs = self._score_completions(original_inputs, generation_batch)
-                breakpoint()
+                # breakpoint()
                 """
                 (Pdb) scored_outputs.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'num_items_in_batch', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'adapter_info', 'advantages'])
@@ -1312,13 +1315,16 @@ class ValSETrainer(BaseTrainer):
                 num_items_in_batch = scored_outputs["num_items_in_batch"]
                 scored_outputs = split_pixel_values_by_grid(scored_outputs)
 
+                # adapter_batches = {}
                 adapter_batches = []
 
-                breakpoint()
+                # breakpoint()
 
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
+                    # breakpoint()
                     adapter_data = {}
                     for key, value in scored_outputs.items():
+                        # breakpoint()
                         total_size = sum(e - s for s, e in adapter_boundaries)
                         if key in ["adapter_info", "num_items_in_batch", "all_extra_fields"]:
                             # Skip metadata - will add back later
@@ -1339,24 +1345,31 @@ class ValSETrainer(BaseTrainer):
                         else:
                             # Non-tensor values
                             adapter_data[key] = value
-                            
-                    adapter_metadata = {
+                        # breakpoint()
+                    adapter_inputs = {
+                        **adapter_data,
                         "adapter_info": {
                             "adapter_names": [adapter_info["adapter_names"][adapter_index]],
                             "num_generations_per_adapter": [adapter_info["num_generations_per_adapter"][adapter_index]],
-                            "adapter_boundaries": [(0, end_index - start_index)],
+                            "adapter_boundaries": [(adapter_boundaries[adapter_index])],
                         },
                         "num_items_in_batch": num_items_in_batch
                     }
+                    # breakpoint()
                     
-                    adapter_batches.append((adapter_data, adapter_metadata))
-                breakpoint()
+                    # adapter_batches = {**adapter_data, **adapter_metadata}
+                    adapter_batches.append(adapter_inputs)
+                # breakpoint()
                 
                 processed_batches = []
-                for adapter_data, adapter_metadata in adapter_batches:
+                for adapter_inputs in adapter_batches:
+                    metadata = {
+                        "adapter_info": adapter_inputs.pop("adapter_info"),
+                        "num_items_in_batch": adapter_inputs.pop("num_items_in_batch"),
+                    }
                     # adapter_data = split_pixel_values_by_grid(adapter_data)
-                    breakpoint()
-                    adapter_data = shuffle_sequence_dict(adapter_data)
+                    # breakpoint()
+                    adapter_data = shuffle_sequence_dict(adapter_inputs)
                     """
                     (Pdb) adapter_data.keys()
                     dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'advantages'])
@@ -1368,7 +1381,7 @@ class ValSETrainer(BaseTrainer):
                     for batch in splits:
                         batch = unsplit_pixel_values_by_grid(batch)
                         # Add back metadata
-                        batch.update(adapter_metadata)
+                        batch.update(metadata)
                         splits_with_metadata.append(batch)
                     processed_batches.append(splits_with_metadata)
                 
@@ -1525,7 +1538,7 @@ class ValSETrainer(BaseTrainer):
 
         other_completions_text = self.processing_class.batch_decode(other_completion_ids, skip_special_tokens = True)
         num_others = len(other_completions_text)
-        breakpoint()
+        # breakpoint()
 
         # print(f"  >> [Diversity Reward] Comparing {len(completions)} completions against {num_others} other completions.")
 
@@ -1542,7 +1555,7 @@ class ValSETrainer(BaseTrainer):
         ):
             print(f"  >> Using `reward_func_diversity`: {reward_func_name}")
             with profiling_context(self, f"reward_func_diversity.{reward_func_name}"):
-                breakpoint()
+                # breakpoint()
                 if isinstance(reward_func, nn.Module): # Module (no PretrainedModel) for compat with compiled models
                     all_similarities = []
 
@@ -1574,13 +1587,22 @@ class ValSETrainer(BaseTrainer):
 
                             with torch.inference_mode():
                                 similarity = reward_func(**reward_inputs).logits[0, 0]
+                                # breakpoint()
                                 similarities.append(similarity.item())
                                 # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
 
-                        rewards_per_func[:, i] = torch.tensor(similarities, dtype = torch.float32, device = device)
+                            all_similarities.append(similarities)
+                            # breakpoint()
 
-                else: # For the case 
+                        rewards_per_func[:, i] = torch.tensor(all_similarities, dtype = torch.float32, device = device)
+
+                else: # For the case not using nn.Module reward functions
                     print(f"  >> Compare using non-module diversity reward function: {reward_func_name}")
+                    if other_completions_text and isinstance(other_completions_text[0], str):
+                        other_completions_text = [[{"role": "assistant", "content": text}] for text in other_completions_text]
+                    else:
+                        other_completions_text = other_completions_text
+
                     reward_kwargs["other_completions"] = other_completions_text
                     reward_kwargs["other_completion_ids"] = [
                         ids[mask.bool()].tolist() for ids, mask in zip(other_completion_ids, other_completion_mask)
@@ -1588,11 +1610,13 @@ class ValSETrainer(BaseTrainer):
                     
                     all_rewards = []
                     for index in range(len(prompts)):
+                        if isinstance(completions[index], str):
+                            curr_completion = [[{"role": "assistant", "content": completions[index]}]]
+                        else:
+                            curr_completion = [completions[index]]
+
                         reordered_prompts = [prompts[index]] + [prompts[index]] * len(other_completions_text)
-                        reordered_completions = [completions[index]] + other_completions_text
-                        reordered_completion_ids = [completion_ids_list[index]] + [
-                            ids[mask.bool()] for ids, mask in zip(other_completion_ids, other_completion_mask)
-                        ]
+                        reordered_completions = curr_completion + other_completions_text
 
                         reordered_kwargs = {}
                         
@@ -1603,10 +1627,10 @@ class ValSETrainer(BaseTrainer):
                                 reordered_kwargs[key] = [value[index]]
 
                         output_reward_func = reward_func(
-                            prompts=[prompts[index]], 
-                            completions=[completions[index]], 
-                            completion_ids=[completion_ids_list[index]] + reward_kwargs["other_completion_ids"], 
-                            **reordered_kwargs
+                            prompts = reordered_prompts, 
+                            completions = reordered_completions, 
+                            completion_ids = [completion_ids_list[index]] + reward_kwargs["other_completion_ids"], 
+                            **reordered_kwargs,
                         )
                         reward_value = output_reward_func[0] if output_reward_func else torch.nan
                         all_rewards.append(reward_value if reward_value is not None else torch.nan)
@@ -1631,7 +1655,7 @@ class ValSETrainer(BaseTrainer):
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
-        breakpoint()
+        # breakpoint()
         return rewards_per_func
 
     def _generate_single_turn(self, prompts: list):
@@ -2095,7 +2119,7 @@ class ValSETrainer(BaseTrainer):
             else:
                 ref_per_token_logps = None
 
-        return {
+        output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -2111,6 +2135,22 @@ class ValSETrainer(BaseTrainer):
                 "adapter_boundaries": adapter_boundaries,
             }
         }
+        # breakpoint()
+
+        # Duplicate the first 'n' generations to match the expected batch size
+        n = self.args.num_generations_per_base_adapter
+
+        output["prompt_ids"] = torch.cat([prompt_ids, prompt_ids[n:]], dim=0)
+        output["prompt_mask"] = torch.cat([prompt_mask, prompt_mask[n:]], dim=0)
+        output["completion_ids"] = torch.cat([completion_ids, completion_ids[n:]], dim=0)
+        output["completion_mask"] = torch.cat([completion_mask, completion_mask[n:]], dim=0)
+        output["old_per_token_logps"] = None if old_per_token_logps is None else torch.cat([old_per_token_logps, old_per_token_logps[n:]], dim=0)
+        output["ref_per_token_logps"] = None if ref_per_token_logps is None else torch.cat([ref_per_token_logps, ref_per_token_logps[n:]], dim=0)
+        if output["sampling_per_token_logps"] is not None:
+            sampling_per_token_logps = torch.cat([sampling_per_token_logps, sampling_per_token_logps[n:]], dim=0)  
+
+        # breakpoint()
+        return output
     
     def _score_completions(
             self, inputs: dict[str, Union[torch.Tensor, Any]], 
@@ -2154,7 +2194,7 @@ class ValSETrainer(BaseTrainer):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+                completions.append([{"role": "assistant", "content": bootstrap + completion}]) # prompt에 이걸 안했네ㅣ;;;
         else:
             completions = completions_text
 
@@ -2177,23 +2217,26 @@ class ValSETrainer(BaseTrainer):
         print(f"  >> [Scoring] Scoring Correctness for a Total of {total_completions} Completions from Each Adapter")
 
         all_correctness_rewards = self._calculate_rewards_correctness(
-            inputs, prompts_text, completions, completion_ids_list
+            inputs, prompts, completions, completion_ids_list
         )
 
         all_rewards_per_func = []
         all_advantages = []
+        # diversity_rewards_list = []
 
         for adapter_index, (adapter_name, num_generations, (start_index, end_index)) in enumerate(zip(adapter_names, num_generations_list, adapter_boundaries)):
             # breakpoint()
             print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
-            adapter_correctness_rewards = all_correctness_rewards
+            adapter_correctness_rewards = all_correctness_rewards.to(device)
             # Shape: (num_generations, num_correctness_reward_funcs) e.g., (3, 1)
 
             if adapter_name == "default":
                 rewards_per_func = adapter_correctness_rewards
+                # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
                 num_generations = self.args.num_generations
-                breakpoint()
+                current_weights = self.reward_weights[:len(self.reward_funcs_correctness)].to(device)
+                # breakpoint()
 
             elif adapter_name.startswith("guidance_"):
                 # For Guidance Adapters (Correctenss + Diversity)
@@ -2206,7 +2249,8 @@ class ValSETrainer(BaseTrainer):
                 }
 
                 # Get current Adapter's Prompts and Completions
-                curr_prompts = prompts_text[start_index:end_index]
+                curr_prompts = prompts[start_index:end_index]
+                # breakpoint()
                 curr_completions = [completions[i] for i in range(start_index, end_index)]
                 curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
 
@@ -2214,50 +2258,46 @@ class ValSETrainer(BaseTrainer):
                 diversity_rewards = self._calculate_rewards_diversity(
                     inputs, curr_prompts, curr_completions, curr_completion_ids_list,
                     other_adapter_data=other_adapter_data
-                )
+                ).to(device)
                 # Shape: (num_generations, num_diversity_reward_funcs) e.g., (3, 2)
-
+                # breakpoint()
                 if self.args.consider_correctness_in_diversity:
-                    correctness_mask = (adapter_correctness_rewards[start_index:end_index] > 0.0).float().unsqueeze(1)  # (N, 1)
+                    correctness_mask = (adapter_correctness_rewards[start_index:end_index] > 0.0).float() # (N, 1)
                     diversity_rewards = diversity_rewards * correctness_mask
 
-                # Combine Correctness and Diversity Rewards
-                rewards_per_func = torch.cat([adapter_correctness_rewards, diversity_rewards], dim=1)
+                rewards_per_func = torch.cat([adapter_correctness_rewards[start_index:end_index], diversity_rewards], dim = 1)
+
                 reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
+
+                current_weights = torch.cat([
+                    self.reward_weights[:len(self.reward_funcs_correctness)].to(device),
+                    torch.ones(len(self.reward_funcs_diversity), dtype=torch.float32, device=device)
+                ]).to(device)
+                    
             else:
                 raise ValueError(f"Unknown adapter name: {adapter_name}")
-        
-            breakpoint()
+            
+            # breakpoint()
 
             for i, reward_func_name in enumerate(reward_func_names):
                 mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
                 self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_rewards)
                 std_func_rewards = nanstd(rewards_per_func[:, i]).item()
                 self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
+                # breakpoint()
 
-            all_rewards_per_func.append(rewards_per_func)
+            # 여기까진 괜찮은 것 같음
+            rewards = (rewards_per_func * current_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
+            all_rewards_per_func.append(rewards_per_func) # list
 
+            # breakpoint()
             # Apply reward weight and Compute advantages
             # Apply reward weights
-            if adapter_name == "default":
-                current_weights = self.reward_weights[:len(self.reward_funcs_correctness)]
-            else:
-                # For guidance adapters: correctness weight + diversity weight
-                current_weights = torch.cat([
-                    self.reward_weights[:len(self.reward_funcs_correctness)],
-                    torch.ones(len(self.reward_funcs_diversity), dtype=torch.float32, device=device)
-                ])
-            rewards = (rewards_per_func * current_weights.to(device).unsqueeze(0)).sum(dim=1)  # (N,)
-
-            # Compute grouped-wise rewards
             mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
-
-            # Normalize the rewards to compute the advantages
             mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
-        
             advantages = rewards - mean_grouped_rewards
 
-            if self.scale_rewards in ["group", "none"]:
+            if self.scale_rewards in ["group", "none"]: # group 
                 # If self.scale_rewards = "none", we'll still log group level std
                 std_rewards = rewards.view(-1, num_generations).std(dim=1)
                 std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
@@ -2279,42 +2319,51 @@ class ValSETrainer(BaseTrainer):
             self._metrics[mode][f"reward_std/{adapter_name}"].append(std_rewards.mean().item())
             self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero.float().mean().item())
 
+        # breakpoint()
         # Concatenate all advantages from different adapters
         all_advantages = torch.cat(all_advantages, dim=0)  # (total_completions,)
 
         # Slice for Distributed Training
-        completions_per_process = total_completions // self.accelerator.num_processes
+        completions_per_process = all_advantages.size(0) #(total_completions + self.args.num_guidance_adapters * self.args.num_generations_per_diversity_adapters) // self.accelerator.num_processes
         process_slice = slice(
-            self.accelerator.process_index * len(completions_per_process),
-            (self.accelerator.process_index + 1) * len(completions_per_process),
+            self.accelerator.process_index * completions_per_process,
+            (self.accelerator.process_index + 1) * completions_per_process,
         )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+        all_process_advantages = all_advantages.clone()  # keep the aggregated advantages for logging
         advantages = all_advantages[process_slice]
+        # breakpoint()
 
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+        self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
-        self._logs["prompts"].extend(gather_object(prompts_text))
-        self._logs["completions"].extend(gather_object(completions_text))
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        # breakpoint()
 
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
+            # breakpoint()
             if adapter_name == "default":
                 func_names = self.reward_func_names_correctness
             else:
                 func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
             
             adapter_rewards = all_rewards_per_func[adapter_index]
+            # breakpoint()
             for i, name in enumerate(func_names):
                 log_key = f"{adapter_name}/{name}"
                 if log_key not in self._logs["rewards"]:
-                    self._logs["rewards"][log_key] = deque(maxlen=self.args.generation_batch_size)
+                    self._logs["rewards"][log_key] = deque(maxlen=all_advantages.size(0))
                 self._logs["rewards"][log_key].extend(adapter_rewards[:, i].tolist())
+                # breakpoint()
+            # breakpoint()
         
+        self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
         self._logs["advantages"].extend(all_process_advantages.tolist())
+        # breakpoint()
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
 
@@ -2417,16 +2466,15 @@ class ValSETrainer(BaseTrainer):
     def _compute_loss(self, model, inputs):
         device = self.accelerator.device
         mode = "train" if model.training else "eval"
-
-        # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
+        breakpoint()
         adapter_name = inputs["adapter_info"]["adapter_names"][0]
         print(f"  >> [Loss Computation] Computing loss for adapter: {adapter_name}")
+        breakpoint()
 
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -2434,6 +2482,7 @@ class ValSETrainer(BaseTrainer):
             input_ids,
             attention_mask,
             logits_to_keep,
+            batch_size=self.args.per_device_train_batch_size,
             compute_entropy=True,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
