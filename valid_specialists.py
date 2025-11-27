@@ -175,7 +175,7 @@ class ValSETrainer(BaseTrainer):
         reward_funcs_correctness: Union[RewardFunc, list[RewardFunc]], # NEW
         reward_funcs_diversity: Union[RewardFunc, list[RewardFunc]], # NEW
         adapter_name: Optional[str] = None, # NEW
-        args: Optional[GRPOConfig] = None,
+        args: Optional[DGRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[Union[PreTrainedTokenizerBase, ProcessorMixin]] = None,
@@ -190,7 +190,7 @@ class ValSETrainer(BaseTrainer):
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
-            args = GRPOConfig(f"{model_name}-GRPO")
+            args = DGRPOConfig(f"{model_name}-GRPO")
 
         # Models
         # Trained model
@@ -313,22 +313,23 @@ class ValSETrainer(BaseTrainer):
 
             self.adapter_names = adapter_list
 
-            self.num_generations_per_adapter = []
-            for name in self.adapter_names:
-                if name == "default":
-                    self.num_generations_per_adapter.append(args.num_generations_per_base_adapter)
-                elif name.startswith("guidance_"):
-                    self.num_generations_per_adapter.append(args.num_generations_per_diversity_adapters)
-                else:
-                    assert False, f"Unknown adapter name '{name}'"
-            
-            self.reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
-
         elif isinstance(adapter_name, str):
             self.adapter_names = [adapter_name]
             
         else:
             raise ValueError("adapter_name must be either None or a string.")
+    
+        
+        self.num_generations_per_adapter = []
+        for name in self.adapter_names:
+            if name == "default":
+                self.num_generations_per_adapter.append(args.num_generations_per_base_adapter)
+            elif name.startswith("guidance_"):
+                self.num_generations_per_adapter.append(args.num_generations_per_diversity_adapters)
+            else:
+                assert False, f"Unknown adapter name '{name}'"
+        
+        self.reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
 
         # breakpoint()
 
@@ -761,7 +762,7 @@ class ValSETrainer(BaseTrainer):
                     
                     # Forward & Backward
                     with self.compute_loss_context_manager():
-                        breakpoint()
+                        # breakpoint()
                         loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
                     if self.args.n_gpu > 1:
@@ -801,106 +802,6 @@ class ValSETrainer(BaseTrainer):
                                 torch.cuda.empty_cache()
             
             return total_loss
-
-            # for adapter_index, (adapter_name, num_generation) in enumerate(zip(adapter_names, num_generations_per_adapter)):
-            #     model.set_adapter(adapter_name)
-                
-            #     adapter_inputs = self._slice_inputs_for_adapter(inputs, adapter_index)
-
-            #     with self.compute_loss_context_manager():
-            #         loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
-            #     if (
-            #         self.args.torch_empty_cache_steps is not None
-            #         and self.state.global_step % self.args.torch_empty_cache_steps == 0
-            #     ):
-            #         if is_torch_xpu_available():
-            #             torch.xpu.empty_cache()
-            #         elif is_torch_mlu_available():
-            #             torch.mlu.empty_cache()
-            #         elif is_torch_musa_available():
-            #             torch.musa.empty_cache()
-            #         elif is_torch_npu_available():
-            #             torch.npu.empty_cache()
-            #         elif is_torch_mps_available():
-            #             torch.mps.empty_cache()
-            #         elif is_torch_hpu_available():
-            #             logger.warning(
-            #                 "`torch_empty_cache_steps` is set but HPU device/backend does not support empty_cache()."
-            #             )
-            #         else:
-            #             torch.cuda.empty_cache()
-
-            #     kwargs = {}
-
-            #     # For LOMO optimizers you need to explicitly use the learning rate
-            #     if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-            #         kwargs["learning_rate"] = self._get_learning_rate()
-
-            #     if self.args.n_gpu > 1:
-            #         loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
-            #     if self.use_apex:
-            #         from apex import amp
-
-            #         with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-            #             scaled_loss.backward()
-            #     else:
-            #         # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
-            #         if (
-            #             not self.model_accepts_loss_kwargs or num_items_in_batch is None
-            #         ) and self.compute_loss_func is None:
-            #             # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
-            #             loss = loss / self.current_gradient_accumulation_steps
-
-            #         # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
-            #         # https://github.com/huggingface/transformers/pull/35808
-            #         if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-            #             kwargs["scale_wrt_gas"] = False
-
-            #         self.accelerator.backward(loss, **kwargs)
-                
-            #     total_loss += loss.detach()
-
-            #     del adapter_inputs
-
-            #     return total_loss
-            
-    # def _slice_inputs_for_adapter(
-    #     self,
-    #     inputs: dict[str, Union[torch.Tensor, Any]],
-    #     adapter_index: int,
-    # ) -> dict[str, Union[torch.Tensor, Any]]:
-    #     adapter_names = inputs["adapter_info"]["adapter_names"]
-    #     num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
-    #     adapter_boundaries = inputs["adapter_info"]["adapter_boundaries"]
-
-    #     batch_size = inputs["prompt"].size(0)
-    #     # start_index = sum(num_generations_per_adapter[:adapter_index]) * batch_size
-    #     # end_index = start_index + num_generations_per_adapter[adapter_index] * batch_size
-    #     start_index, end_index = adapter_boundaries[adapter_index]
-
-    #     adapter_inputs = {}
-
-    #     for key in ["prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "advantages"]:
-    #         if key in inputs and inputs[key] is not None:
-    #             adapter_inputs[key] = inputs[key][start_index:end_index]
-
-    #     for key in ["old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps", 
-    #                 "importance_sampling_ratio", "token_type_ids"]:
-    #         if key in inputs and inputs[key] is not None:
-    #             adapter_inputs[key] = inputs[key][start_index:end_index]
-
-    #     for key in ["adapter_info", "num_items_in_batch"]:
-    #         if key in inputs:
-    #             adapter_inputs[key] = inputs[key]
-
-    #     adapter_inputs["adapter_info"] = {
-    #         "adapter_names": [adapter_names[adapter_index]],
-    #         "num_generations_per_adapter": [num_generations_per_adapter[adapter_index]],
-    #     }
-
-    #     return adapter_inputs
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1098,7 +999,7 @@ class ValSETrainer(BaseTrainer):
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
-        breakpoint()
+        # breakpoint()
         for start in range(0, input_ids.size(0), batch_size):
             # breakpoint()
             input_ids_batch = input_ids[start : start + batch_size]
@@ -1300,10 +1201,22 @@ class ValSETrainer(BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 original_inputs = generation_batch
+
+                print(original_inputs)
+                print(f">>> [Generation Step] Generating completions for step {self._step}/{generate_every}...")
+                print(self.args.steps_per_generation)
                 # breakpoint()
                 generation_batch = self._generate_completions(generation_batch)
                 # breakpoint()
                 scored_outputs = self._score_completions(original_inputs, generation_batch)
+
+                for key in scored_outputs.keys():
+                    if isinstance(scored_outputs[key], torch.Tensor):
+                        print(f"  >> scored_outputs['{key}']: {scored_outputs[key].shape} {scored_outputs[key].dtype}")
+                    elif isinstance(scored_outputs[key], list):
+                        print(f"  >> scored_outputs['{key}']: List of length {len(scored_outputs[key])}")
+                    if key == "num_items_in_batch" or key == "all_extra_fields":
+                        print(f"      >> scored_outputs['{key}']: {scored_outputs[key]}")
                 # breakpoint()
                 """
                 (Pdb) scored_outputs.keys()
@@ -1323,29 +1236,34 @@ class ValSETrainer(BaseTrainer):
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
                     # breakpoint()
                     adapter_data = {}
+                    adv_index = 0
                     for key, value in scored_outputs.items():
-                        # breakpoint()
-                        total_size = sum(e - s for s, e in adapter_boundaries)
-                        if key in ["adapter_info", "num_items_in_batch", "all_extra_fields"]:
-                            # Skip metadata - will add back later
-                            continue
-                        elif isinstance(value, torch.Tensor):
-                            # Check if this tensor has a batch dimension matching total completions
-                            if value.size(0) == total_size:
-                                adapter_data[key] = value[start_index:end_index]
-                            else:
-                                # Keep as-is (e.g., scalar or different shape)
-                                adapter_data[key] = value
-
-                        elif isinstance(value, list):
-                            if len(value) == total_size:
-                                adapter_data[key] = value[start_index:end_index]
-                            else:
-                                adapter_data[key] = value
+                        if key == "advantages" or key == "old_per_token_logps":
+                            # advantages are already repeated per generation
+                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)]
+                        elif key == "num_items_in_batch":
+                            pass
+                        # elif key == "all_extra_fields":
+                        #     pass
                         else:
-                            # Non-tensor values
-                            adapter_data[key] = value
+                            if isinstance(value, (torch.Tensor, list)):
+                                if len(value) > 0:
+                                    sliced_val = value[start_index:end_index]
+                                    if len(sliced_val) == (end_index - start_index):
+                                        adapter_data[key] = sliced_val
+                            # if isinstance(value, torch.Tensor) and value.size(0) > 0:
+                            #     adapter_data[key] = value[start_index:end_index]
+                            # elif isinstance(value, list) and len(value) > 0:
+                            #     adapter_data[key] = value[start_index:end_index]
+                            # else:
+                            #     adapter_data[key] = value[start_index:end_index]
                         # breakpoint()
+                    
+                    adapter_data = split_pixel_values_by_grid(adapter_data)
+                    # breakpoint()
+                    adapter_data = shuffle_sequence_dict(adapter_data)
+                    # generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                    adapter_data = unsplit_pixel_values_by_grid(adapter_data)
                     adapter_inputs = {
                         **adapter_data,
                         "adapter_info": {
@@ -1359,41 +1277,11 @@ class ValSETrainer(BaseTrainer):
                     
                     # adapter_batches = {**adapter_data, **adapter_metadata}
                     adapter_batches.append(adapter_inputs)
-                # breakpoint()
-                
-                processed_batches = []
-                for adapter_inputs in adapter_batches:
-                    metadata = {
-                        "adapter_info": adapter_inputs.pop("adapter_info"),
-                        "num_items_in_batch": adapter_inputs.pop("num_items_in_batch"),
-                    }
-                    # adapter_data = split_pixel_values_by_grid(adapter_data)
-                    # breakpoint()
-                    adapter_data = shuffle_sequence_dict(adapter_inputs)
-                    """
-                    (Pdb) adapter_data.keys()
-                    dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'advantages'])
-                    """
-                    splits = split_tensor_dict(adapter_data, self.args.steps_per_generation)
-                    
-                    # Unsplit each piece
-                    splits_with_metadata = []
-                    for batch in splits:
-                        batch = unsplit_pixel_values_by_grid(batch)
-                        # Add back metadata
-                        batch.update(metadata)
-                        splits_with_metadata.append(batch)
-                    processed_batches.append(splits_with_metadata)
-                
-                self._buffered_inputs = []
-                for step_index in range(self.args.steps_per_generation):
-                    step_batch = {
-                        "adapter_batches": [batches[step_index] for batches in processed_batches],
-                    }
-                    self._buffered_inputs.append(step_batch)
-                    
-            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+                self._buffered_inputs = [{"adapter_batches":adapter_batches}]
+
+            inputs = self._buffered_inputs[self._step % len(self._buffered_inputs)]
             self._step += 1
+
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
@@ -1994,9 +1882,6 @@ class ValSETrainer(BaseTrainer):
             # Repeat each prompt 'num_generations' times for the current adapter
             # batch_size = len(inputs)
 
-            prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                self._generate(prompts[:num_generation])  # only use the first 'num_generation' prompts
-            )
             # breakpoint()
             """
             (Pdb) len(completion_ids_list[0])
@@ -2005,8 +1890,16 @@ class ValSETrainer(BaseTrainer):
             tensor(412, device='cuda:0')
             """
             start_index = current_adapter
-            end_index = current_adapter + len(prompt_ids_list)
-            adapter_boundaries.append((start_index, end_index))
+            end_index = current_adapter + num_generation
+            
+            prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
+                self._generate(prompts[start_index:end_index]) 
+            )
+
+            if adapter_name == "default":
+                adapter_boundaries.append((start_index, sum(self.num_generations_per_adapter)))
+            else:
+                adapter_boundaries.append((start_index, end_index))
             current_adapter = end_index
             # breakpoint()
 
@@ -2070,28 +1963,26 @@ class ValSETrainer(BaseTrainer):
             )
 
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                )
+            ):  
+                all_old_per_token_logps = []
+                for start_index, end_index in adapter_boundaries:
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids[start_index:end_index],
+                        attention_mask[start_index:end_index],
+                        logits_to_keep,
+                        end_index-start_index,
+                        num_images=num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+                    all_old_per_token_logps.append(old_per_token_logps)
+                old_per_token_logps = torch.cat(all_old_per_token_logps, dim=0)
             else:
                 old_per_token_logps = None
+            # breakpoint()
 
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
@@ -2135,21 +2026,6 @@ class ValSETrainer(BaseTrainer):
                 "adapter_boundaries": adapter_boundaries,
             }
         }
-        # breakpoint()
-
-        # Duplicate the first 'n' generations to match the expected batch size
-        n = self.args.num_generations_per_base_adapter
-
-        output["prompt_ids"] = torch.cat([prompt_ids, prompt_ids[n:]], dim=0)
-        output["prompt_mask"] = torch.cat([prompt_mask, prompt_mask[n:]], dim=0)
-        output["completion_ids"] = torch.cat([completion_ids, completion_ids[n:]], dim=0)
-        output["completion_mask"] = torch.cat([completion_mask, completion_mask[n:]], dim=0)
-        output["old_per_token_logps"] = None if old_per_token_logps is None else torch.cat([old_per_token_logps, old_per_token_logps[n:]], dim=0)
-        output["ref_per_token_logps"] = None if ref_per_token_logps is None else torch.cat([ref_per_token_logps, ref_per_token_logps[n:]], dim=0)
-        if output["sampling_per_token_logps"] is not None:
-            sampling_per_token_logps = torch.cat([sampling_per_token_logps, sampling_per_token_logps[n:]], dim=0)  
-
-        # breakpoint()
         return output
     
     def _score_completions(
@@ -2219,6 +2095,7 @@ class ValSETrainer(BaseTrainer):
         all_correctness_rewards = self._calculate_rewards_correctness(
             inputs, prompts, completions, completion_ids_list
         )
+        # breakpoint()
 
         all_rewards_per_func = []
         all_advantages = []
@@ -2226,12 +2103,13 @@ class ValSETrainer(BaseTrainer):
 
         for adapter_index, (adapter_name, num_generations, (start_index, end_index)) in enumerate(zip(adapter_names, num_generations_list, adapter_boundaries)):
             # breakpoint()
-            print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
             adapter_correctness_rewards = all_correctness_rewards.to(device)
             # Shape: (num_generations, num_correctness_reward_funcs) e.g., (3, 1)
+            
+            print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
 
             if adapter_name == "default":
-                rewards_per_func = adapter_correctness_rewards
+                rewards_per_func = adapter_correctness_rewards[start_index:end_index]
                 # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
                 num_generations = self.args.num_generations
@@ -2342,6 +2220,7 @@ class ValSETrainer(BaseTrainer):
         self._logs["completion"].extend(gather_object(completions_text))
         # breakpoint()
 
+        # 여기서부터가 문제인듯
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
@@ -2356,12 +2235,15 @@ class ValSETrainer(BaseTrainer):
             for i, name in enumerate(func_names):
                 log_key = f"{adapter_name}/{name}"
                 if log_key not in self._logs["rewards"]:
+                    total_completions = sum(e - s for s, e in adapter_boundaries)
                     self._logs["rewards"][log_key] = deque(maxlen=all_advantages.size(0))
                 self._logs["rewards"][log_key].extend(adapter_rewards[:, i].tolist())
                 # breakpoint()
             # breakpoint()
         
-        self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
+        if not isinstance(self._logs["advantages"], deque):
+
+            self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
         self._logs["advantages"].extend(all_process_advantages.tolist())
         # breakpoint()
 
@@ -2471,10 +2353,12 @@ class ValSETrainer(BaseTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        breakpoint()
+        # breakpoint()
         adapter_name = inputs["adapter_info"]["adapter_names"][0]
         print(f"  >> [Loss Computation] Computing loss for adapter: {adapter_name}")
-        breakpoint()
+        # breakpoint()
+
+        total_loss = 0.0
 
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -2626,7 +2510,9 @@ class ValSETrainer(BaseTrainer):
         self._metrics[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
+            breakpoint()
             if is_rich_available():
+                breakpoint()
                 print_prompt_completions_sample(
                     self._logs["prompt"],
                     self._logs["completion"],
