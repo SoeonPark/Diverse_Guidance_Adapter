@@ -565,7 +565,7 @@ class ValSETrainer(BaseTrainer):
                     else:
                         base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
                     self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
-                    self.vllm_client.init_communicator(device=torch.cuda.current_device())
+                    # self.vllm_client.init_communicator(device=torch.cuda.current_device())
 
             elif self.vllm_mode == "colocate":
                 # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
@@ -614,6 +614,7 @@ class ValSETrainer(BaseTrainer):
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
                     # Important so temperature scaling/logit tweaking affects the TIS log probs
                     logprobs_mode="processed_logprobs",
+                    enable_lora = True,
                 )
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=2)
@@ -1118,6 +1119,10 @@ class ValSETrainer(BaseTrainer):
             # merging adapters in a sharded manner is not supported.
             # TODO: does this work with FSDP?
             with gather_if_zero3(list(self.model.parameters())):
+
+                current_adapter = self.model.active_adapter
+                logger.info(f"Syncing PEFT adapter '{current_adapter}' parameters to vLLM...")
+
                 self.model.merge_adapter()
 
                 # Update vLLM weights while parameters are gathered
@@ -1133,22 +1138,40 @@ class ValSETrainer(BaseTrainer):
                     elif fsdp_version == 2:
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name and discard some parameters
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                    if self.vllm_mode == "colocate":
+                        base_model = self.model.get_base_model()
+                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
 
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                        weights_to_load = []
+                        # DeepSpeed ZeRO-3 with PEFT
+                        for name, param in self.model.named_parameters():
+                            clean_name = self._fix_param_name_to_vllm(
+                                name.replace("base_model.model.", "").replace("model.", "")
+                            )
+                            weights_to_load.append((clean_name, param.data.contiguous()))
+
+                        if weights_to_load:
+                            llm_model.load_weights(weights_to_load)
+                            logger.info(f"Loaded {len(weights_to_load)} parameters into vLLM colocated model.")
+
+                    
+                    elif self.vllm_mode == "server" and self.accelerator.is_main_process:
+                        for name, param in self.model.named_parameters():
+                            # When using PEFT, we need to recover the original parameter name and discard some parameters
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            if self.model.prefix in name:
+                                continue
+                            # When module to save, remove its prefix and discard the original module
+                            if "original_module" in name:
+                                continue
+                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
                             self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+
+                            # if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                            #     self.vllm_client.update_named_param(name, param.data)
+                            # elif self.vllm_mode == "colocate":
+                            #     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                            #     llm_model.load_weights([(name, param.data)])
                 # Unmerge adapters while parameters are still gathered
                 self.model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
@@ -1574,6 +1597,8 @@ class ValSETrainer(BaseTrainer):
                     # prompt individually.
                     ordered_set_of_prompts = all_prompts[:: self.num_generations]
 
+                    breakpoint()
+
                     sampling_params = {
                         "n": self.num_generations,
                         "repetition_penalty": self.repetition_penalty,
@@ -1612,6 +1637,9 @@ class ValSETrainer(BaseTrainer):
                                 output = self.vllm_client.generate(prompts=ordered_set_of_prompts, **sampling_params)
                         # Extract required fields and collect any extra fields for reward functions
                         required_keys = {"prompt_ids", "completion_ids", "logprobs"}
+
+                        breakpoint()
+
                         extra_fields = {k: v for k, v in output.items() if k not in required_keys}
                         payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"], extra_fields)
                 else:
@@ -1621,6 +1649,7 @@ class ValSETrainer(BaseTrainer):
                 obj_list = [payload]
                 broadcast_object_list(obj_list, from_process=0)
                 all_prompt_ids, all_completion_ids, all_logprobs, all_extra_fields = obj_list[0]
+                breakpoint()
 
                 # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
                 all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(self.num_generations)]
@@ -1640,6 +1669,8 @@ class ValSETrainer(BaseTrainer):
                         extra_fields[key] = values[process_slice]
                     else:
                         extra_fields[key] = values
+
+                breakpoint()
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
@@ -1877,6 +1908,10 @@ class ValSETrainer(BaseTrainer):
         for adapter_index, (adapter_name, num_generation) in enumerate(zip(self.adapter_names, self.num_generations_per_adapter)):
             if is_peft_available() and isinstance(self.model, PeftModel):
                 self.model.set_adapter(adapter_name)
+                if self.use_vllm and self.vllm_mode == "colocate":
+                    self._move_model_to_vllm()  # update vLLM weights for the new adapter
+                    self._last_loaded_step = self.state.global_step
+
             print(f"  >> [Rollout] Generating {num_generation} completions using adapter '{adapter_name}'")
             
             # Repeat each prompt 'num_generations' times for the current adapter
