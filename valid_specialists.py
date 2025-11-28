@@ -2220,7 +2220,7 @@ class ValSETrainer(BaseTrainer):
         self._logs["completion"].extend(gather_object(completions_text))
         # breakpoint()
 
-        # 여기서부터가 문제인듯
+        gathered_rewards_dict = {}
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
@@ -2231,11 +2231,11 @@ class ValSETrainer(BaseTrainer):
                 func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
             
             adapter_rewards = all_rewards_per_func[adapter_index]
+            gathered_adapter_rewards = gather(adapter_rewards)
             # breakpoint()
             for i, name in enumerate(func_names):
                 log_key = f"{adapter_name}/{name}"
                 if log_key not in self._logs["rewards"]:
-                    total_completions = sum(e - s for s, e in adapter_boundaries)
                     self._logs["rewards"][log_key] = deque(maxlen=all_advantages.size(0))
                 self._logs["rewards"][log_key].extend(adapter_rewards[:, i].tolist())
                 # breakpoint()
@@ -2510,14 +2510,36 @@ class ValSETrainer(BaseTrainer):
         self._metrics[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
+            if not self._logs["prompt"] or not self._logs["completion"]:
+                return
+            
             breakpoint()
+
+            # Check for the length of all Deque
+            reward_lengths = [len(v) for v in self._logs["rewards"].values()] if self._logs["rewards"] else [0]
+            min_length = min(
+                len(self._logs["prompt"]), 
+                len(self._logs["completion"]), 
+                len(self._logs["advantages"]),
+                min(reward_lengths) if reward_lengths else 0
+            )
+            if min_length == 0:
+                logger.warning("No completions to log.")
+                return
+            
+            breakpoint()
+
+            flattened_rewards = {}
+            for key, values in self._logs["rewards"].items():
+                flattened_reward = key.replace("/", "_")
+                flattened_rewards[flattened_reward] = list(values)[:min_length]
+
             if is_rich_available():
-                breakpoint()
                 print_prompt_completions_sample(
-                    self._logs["prompt"],
-                    self._logs["completion"],
-                    self._logs["rewards"],
-                    self._logs["advantages"],
+                    list(self._logs["prompt"])[:min_length],
+                    list(self._logs["completion"])[:min_length],
+                    flattened_rewards,
+                    list(self._logs["advantages"])[:min_length],
                     self.state.global_step,
                     self.num_completions_to_print,
                 )
@@ -2527,6 +2549,8 @@ class ValSETrainer(BaseTrainer):
                 logging_backends.append(wandb)
             if self.args.report_to and "trackio" in self.args.report_to:
                 logging_backends.append(trackio)
+
+            breakpoint()
 
             if logging_backends:
                 import pandas as pd
