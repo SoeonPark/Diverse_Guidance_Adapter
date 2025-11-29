@@ -141,6 +141,7 @@ else:
 
 
 logger = logging.get_logger(__name__)
+logging.getLogger("vllm").setLevel(logging.WARNING)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -570,11 +571,13 @@ class ValSETrainer(BaseTrainer):
             elif self.vllm_mode == "colocate":
                 # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
                 # the same number of ranks
+
                 if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
                     raise ValueError(
                         f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
                         f"({self.accelerator.num_processes}) evenly."
                     )
+
 
                 if self.vllm_tensor_parallel_size > 1:
                     # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
@@ -597,6 +600,38 @@ class ValSETrainer(BaseTrainer):
                     max_model_len = self.max_prompt_length + self.max_completion_length
                 else:
                     max_model_len = None
+
+                # [Custom] Set path to temporary cache directory for vLLM for each adapter
+                import tempfile
+                self.lora_temp_dir = tempfile.mkdtemp(prefix="vllm_lora_cache_")
+
+                self.lora_modules = None
+                if is_peft_model(model):
+                    self.lora_modules = []
+                    for adapter_index, adapter_name in enumerate(self.adapter_names):
+                        adapter_path = os.path.join(self.lora_temp_dir, f"{adapter_name}_adapter")
+                        os.makedirs(adapter_path, exist_ok=True)
+
+                        # Save each adapter to a separate directory
+                        model.set_adapter(adapter_name)
+                        # Save only PEFT adapters to the adapter_path
+                        model.save_pretrained(adapter_path, save_adapter = True, save_config = True)
+
+                        self.lora_modules.append(
+                            {
+                                "name": adapter_name,
+                                "path": adapter_path,
+                                "id": adapter_index + 1, 
+                            }
+                        )
+                    print(f"  >> [vLLM Init] LoRA modules saved to temporary cache directory: {self.lora_temp_dir} | Total adapters: {len(self.lora_modules)}")
+
+                # Initialize the vLLM LLM instance
+                if self.max_prompt_length is not None and self.max_completion_length is not None:
+                    max_model_len = self.max_prompt_length + self.max_completion_length
+                else:
+                    max_model_len = None
+
                 self.llm = LLM(
                     model=model.name_or_path,
                     tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -615,9 +650,12 @@ class ValSETrainer(BaseTrainer):
                     # Important so temperature scaling/logit tweaking affects the TIS log probs
                     logprobs_mode="processed_logprobs",
                     enable_lora = True,
-                    quantization = "bitsandbytes",
-                    load_format = "bitsandbytes",
+                    max_loras = len(self.adapter_names) if self.lora_modules else None,
+                    max_lora_rank = 8,
+                    quantization = "bitsandbytes", 
+                    load_format = "bitsandbytes"
                 )
+
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=2)
             else:
@@ -1105,7 +1143,7 @@ class ValSETrainer(BaseTrainer):
                 llm_model.load_weights([(name, param)])
 
     @profiling_decorator
-    def _move_model_to_vllm(self):
+    def _move_model_to_vllm(self, adapter_name: Optional[str] = None):
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
@@ -1116,45 +1154,63 @@ class ValSETrainer(BaseTrainer):
         else:
             gather_if_zero3 = nullcontext
 
-        if is_peft_model(self.model):
+        if is_peft_model(self.model) and self.lora_modules:
             # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
             # merging adapters in a sharded manner is not supported.
             # TODO: does this work with FSDP?
-            with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
+            adapters_to_process = [adapter_name] if adapter_name else self.adapter_names
 
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                    if fsdp_version == 1:
-                        self._sync_fsdp1_params_to_vllm(
-                            self.model
-                        )  # use memory-efficient post-order traversal for FSDP
-                    elif fsdp_version == 2:
-                        self._sync_fsdp2_params_to_vllm(self.model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name and discard some parameters
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+            for adapter in adapters_to_process:
+                print(f"  >> [vLLM Sync] Syncing Adapter '{adapter}' to vLLM...")
 
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-                # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
-                # Parameters will automatically be repartitioned when exiting the context
+                adapter_info = next((module for module in self.lora_modules if module["name"] == adapter), None)
+
+                if not adapter_info:
+                    print(f"  >> [Warning] Adapter info for '{adapter}' not found in lora_modules.")
+                    continue
+
+                self.model.set_adapter(adapter)
+                adapter_path = adapter_info["path"]
+                with gather_if_zero3(list(self.model.parameters())):
+                    # self.model.merge_adapter()
+
+                    self.model.save_pretrained(
+                        adapter_path, save_adapter=True, save_config=True, safe_serialization=True
+                    )
+                    print(f"  >> [vLLM Sync] Adapter '{adapter}' merged and saved to '{adapter_path}'.")
+
+                    # # Update vLLM weights while parameters are gathered
+                    # if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
+                    #     # Update vLLM weights while parameters are gathered
+                    #     # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                    #     fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+                    #     fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+                    #     if fsdp_version == 1:
+                    #         self._sync_fsdp1_params_to_vllm(
+                    #             self.model
+                    #         )  # use memory-efficient post-order traversal for FSDP
+                    #     elif fsdp_version == 2:
+                    #         self._sync_fsdp2_params_to_vllm(self.model)
+                    # else:
+                    #     # DeepSpeed ZeRO-3 with PEFT
+                    #     for name, param in self.model.named_parameters():
+                    #         # When using PEFT, we need to recover the original parameter name and discard some parameters
+                    #         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                    #         if self.model.prefix in name:
+                    #             continue
+                    #         # When module to save, remove its prefix and discard the original module
+                    #         if "original_module" in name:
+                    #             continue
+                    #         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+
+                    #         if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                    #             self.vllm_client.update_named_param(name, param.data)
+                    #         elif self.vllm_mode == "colocate":
+                    #             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                    #             llm_model.load_weights([(name, param.data)])
+                    # # Unmerge adapters while parameters are still gathered
+                    # self.model.unmerge_adapter()
+                    # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and update each parameter individually.
             if self.is_fsdp_enabled:
@@ -1549,7 +1605,7 @@ class ValSETrainer(BaseTrainer):
         # breakpoint()
         return rewards_per_func
 
-    def _generate_single_turn(self, prompts: list):
+    def _generate_single_turn(self, prompts: list, adapter_name: Optional[str] = None):
         device = self.accelerator.device
 
         # Generate completions using either vLLM or regular generation
@@ -1561,7 +1617,10 @@ class ValSETrainer(BaseTrainer):
 
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
+                if adapter_name:
+                    self._move_model_to_vllm(adapter_name=adapter_name)
+                else:
+                    self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             if is_conversational({"prompt": prompts[0]}):
@@ -1577,8 +1636,6 @@ class ValSETrainer(BaseTrainer):
                     # prompt individually.
                     ordered_set_of_prompts = all_prompts[:: self.num_generations]
 
-                    breakpoint()
-
                     sampling_params = {
                         "n": self.num_generations,
                         "repetition_penalty": self.repetition_penalty,
@@ -1591,6 +1648,7 @@ class ValSETrainer(BaseTrainer):
                         "guided_decoding_regex": self.guided_decoding_regex,
                         "generation_kwargs": self.args.generation_kwargs,
                     }
+
                     with profiling_context(self, "vLLM.generate"):
                         if self.rollout_func is not None:
                             if is_conversational({"prompt": ordered_set_of_prompts[0]}):
@@ -1612,14 +1670,12 @@ class ValSETrainer(BaseTrainer):
                                     prompts=ordered_set_of_prompts,
                                     **sampling_params,
                                     chat_template_kwargs=self.chat_template_kwargs,
+                                    lora_request=lora_request,
                                 )
                             else:
-                                output = self.vllm_client.generate(prompts=ordered_set_of_prompts, **sampling_params)
+                                output = self.vllm_client.generate(prompts=ordered_set_of_prompts, **sampling_params, lora_request=lora_request)
                         # Extract required fields and collect any extra fields for reward functions
                         required_keys = {"prompt_ids", "completion_ids", "logprobs"}
-
-                        breakpoint()
-
                         extra_fields = {k: v for k, v in output.items() if k not in required_keys}
                         payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"], extra_fields)
                 else:
@@ -1629,7 +1685,6 @@ class ValSETrainer(BaseTrainer):
                 obj_list = [payload]
                 broadcast_object_list(obj_list, from_process=0)
                 all_prompt_ids, all_completion_ids, all_logprobs, all_extra_fields = obj_list[0]
-                breakpoint()
 
                 # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
                 all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(self.num_generations)]
@@ -1649,8 +1704,6 @@ class ValSETrainer(BaseTrainer):
                         extra_fields[key] = values[process_slice]
                     else:
                         extra_fields[key] = values
-
-                breakpoint()
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
@@ -1675,6 +1728,20 @@ class ValSETrainer(BaseTrainer):
                     generation_kwargs.update(self.args.generation_kwargs)
                 sampling_params = SamplingParams(**generation_kwargs)
 
+                lora_request = None
+                if adapter_name and self.lora_modules:
+                    adapter_info = next(
+                        (module for module in self.lora_modules if module["name"] == adapter_name), None
+                    )
+                    if adapter_info:
+                        from vllm.lora.request import LoRARequest
+                        lora_request = LoRARequest(
+                            lora_name=adapter_info["name"],
+                            lora_int_id = adapter_info["id"],
+                            lora_local_path = adapter_info["path"],
+                        )
+                        print(f"  >> Using LoRA adapter in vLLM generation: {adapter_name} (id: {adapter_info['id']})")
+
                 if self.vllm_tensor_parallel_size > 1:
                     # Gather prompts from all ranks in the TP group and flatten.
                     # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
@@ -1690,9 +1757,9 @@ class ValSETrainer(BaseTrainer):
 
                 with profiling_context(self, "vLLM.generate"):
                     if is_conversational({"prompt": prompts[0]}):
-                        all_outputs = self.llm.chat(all_prompts, sampling_params=sampling_params, use_tqdm=False)
+                        all_outputs = self.llm.chat(all_prompts, sampling_params=sampling_params, use_tqdm=False, lora_request=lora_request)
                     else:
-                        all_outputs = self.llm.generate(all_prompts, sampling_params=sampling_params, use_tqdm=False)
+                        all_outputs = self.llm.generate(all_prompts, sampling_params=sampling_params, use_tqdm=False, lora_request=lora_request)
 
                 all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
                 all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
@@ -1816,11 +1883,11 @@ class ValSETrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
-    def _generate(self, prompts: list):
+    def _generate(self, prompts: list, adapter_name: Optional[str] = None):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
+        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts, adapter_name)
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1908,7 +1975,7 @@ class ValSETrainer(BaseTrainer):
             end_index = current_adapter + num_generation
             
             prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                self._generate(prompts[start_index:end_index]) 
+                self._generate(prompts[start_index:end_index], adapter_name=adapter_name) 
             )
 
             if adapter_name == "default":
@@ -1926,6 +1993,12 @@ class ValSETrainer(BaseTrainer):
             total_num_items += num_items_in_batch
             # breakpoint()
             print(f"  >> [Rollout] Generated a total of {total_num_items} completion tokens. | Adapter boundaries: {adapter_boundaries} | Adapter names: {adapter_name}")
+
+        if self.use_vllm and self.vllm_mode == "colocate":
+            if self.args.vllm_enable_sleep_mode:
+                print("  >> [Memory] Putting vLLM to sleep to save resources.")
+                self.llm.sleep(level=2)
+            torch.cuda.empty_cache()
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids_list]
