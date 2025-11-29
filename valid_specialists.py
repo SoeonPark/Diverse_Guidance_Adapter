@@ -615,6 +615,8 @@ class ValSETrainer(BaseTrainer):
                     # Important so temperature scaling/logit tweaking affects the TIS log probs
                     logprobs_mode="processed_logprobs",
                     enable_lora = True,
+                    quantization = "bitsandbytes",
+                    load_format = "bitsandbytes",
                 )
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=2)
@@ -1119,247 +1121,37 @@ class ValSETrainer(BaseTrainer):
             # merging adapters in a sharded manner is not supported.
             # TODO: does this work with FSDP?
             with gather_if_zero3(list(self.model.parameters())):
+                self.model.merge_adapter()
 
-                current_adapter = self.model.active_adapter
-                logger.info(f"Syncing PEFT adapter '{current_adapter}' parameters to vLLM...")
-        
-                # ===== 4-bit quantization 체크 및 경고 =====
-                base_model = self.model.get_base_model()
-                is_4bit = getattr(base_model, "is_loaded_in_4bit", False) or \
-                        any(hasattr(module, "quant_state") for module in base_model.modules())
-                
-                if is_4bit:
-                    logger.warning(
-                        "Detected 4-bit quantization with LoRA. Merge/unmerge operations may cause "
-                        "rounding errors and training instability. Consider using:"
-                        "\n  1. 8-bit quantization instead (load_in_8bit=True)"
-                        "\n  2. Full precision training"
-                        "\n  3. Disabling adapter merging (though this may impact vLLM compatibility)"
-                    )
-                
-                # ===== vLLM에 직접 LoRA weights 전송 (merge 없이) =====
-                if self.vllm_mode == "colocate" and hasattr(self.llm.llm_engine, "add_lora"):
-                    # vLLM이 LoRA를 직접 지원하는 경우 (최신 버전)
-                    logger.info(f"Using vLLM native LoRA support for adapter '{current_adapter}'")
-                    
-                    # LoRA weights만 추출
-                    lora_weights = {}
+                # Update vLLM weights while parameters are gathered
+                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
+                    # Update vLLM weights while parameters are gathered
+                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                    fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+                    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+                    if fsdp_version == 1:
+                        self._sync_fsdp1_params_to_vllm(
+                            self.model
+                        )  # use memory-efficient post-order traversal for FSDP
+                    elif fsdp_version == 2:
+                        self._sync_fsdp2_params_to_vllm(self.model)
+                else:
+                    # DeepSpeed ZeRO-3 with PEFT
                     for name, param in self.model.named_parameters():
-                        if "lora_" in name.lower():
-                            clean_name = name.replace("base_model.model.", "")
-                            lora_weights[clean_name] = param.data
-                    
-                    # vLLM에 LoRA adapter 추가
-                    self.llm.llm_engine.add_lora(current_adapter, lora_weights)
-                    self.llm.llm_engine.set_active_lora(current_adapter)
-                    
-                else:
-                    # vLLM이 LoRA를 직접 지원하지 않는 경우 - merge 필요
-                    logger.warning("vLLM does not support native LoRA, using merge approach (may have rounding errors)")
-                    
-                    with gather_if_zero3(list(self.model.parameters())):
-                        # Merge adapter
-                        self.model.merge_adapter()
+                        # When using PEFT, we need to recover the original parameter name and discard some parameters
+                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                        if self.model.prefix in name:
+                            continue
+                        # When module to save, remove its prefix and discard the original module
+                        if "original_module" in name:
+                            continue
+                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
 
-                        # Update vLLM weights
-                        if self.is_fsdp_enabled:
-                            fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                            fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                            if fsdp_version == 1:
-                                self._sync_fsdp1_params_to_vllm(self.model)
-                            elif fsdp_version == 2:
-                                self._sync_fsdp2_params_to_vllm(self.model)
-                                
-                # self.model.merge_adapter()
-
-                # # Update vLLM weights while parameters are gathered
-                # if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                #     # Update vLLM weights while parameters are gathered
-                #     # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                #     fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                #     fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                #     if fsdp_version == 1:
-                #         self._sync_fsdp1_params_to_vllm(
-                #             self.model
-                #         )  # use memory-efficient post-order traversal for FSDP
-                #     elif fsdp_version == 2:
-                #         self._sync_fsdp2_params_to_vllm(self.model)
-                else:
-                    if self.vllm_mode == "colocate":
-                        base_model = self.model.get_base_model()
-                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-                        weights_to_load = []
-
-                        vllm_state_dict = llm_model.state_dict()
-                        vllm_param_names = set(vllm_state_dict.keys())
-                        logger.info(f"vLLM model has {len(vllm_param_names)} parameters")
-                        logger.info(f"First 10 vLLM parameters: {list(vllm_param_names)[:10]}")
-                        
-                        # DeepSpeed ZeRO-3 with PEFT
-                        for name, param in self.model.named_parameters():
-                            # PEFT 관련 prefix 제거
-                            clean_name = name.replace("base_model.model.", "")
-                            
-                            # base_layer suffix 제거
-                            clean_name = clean_name.replace(".base_layer", "")
-                            
-                            # modules_to_save prefix 처리
-                            if "modules_to_save.default." in clean_name:
-                                clean_name = clean_name.replace("modules_to_save.default.", "")
-                            
-                            # PEFT adapter parameters는 스킵 (lora_A, lora_B 등)
-                            if "lora_" in clean_name.lower() or "modules_to_save" in name:
-                                continue
-                            
-                            # original_module은 스킵
-                            if "original_module" in clean_name:
-                                continue
-                            
-                            # vLLM은 model. prefix 없이 파라미터를 기대할 수 있음
-                            # 양쪽 버전 모두 시도
-                            possible_names = [clean_name]
-                            
-                            if clean_name.startswith("model."):
-                                # model. prefix 제거한 버전도 추가
-                                possible_names.append(clean_name[6:])
-                            else:
-                                # model. prefix 추가한 버전도 추가
-                                possible_names.append(f"model.{clean_name}")
-                            
-                            # vLLM에서 매칭되는 이름 찾기
-                            matched_name = None
-                            if vllm_param_names is not None:
-                                for possible_name in possible_names:
-                                    if possible_name in vllm_param_names:
-                                        matched_name = possible_name
-                                        break
-                            else:
-                                # 검증할 수 없으면 첫 번째 이름 사용
-                                matched_name = possible_names[0]
-                            
-                            if matched_name:
-                                weights_to_load.append((matched_name, param.data.contiguous()))
-                            elif vllm_param_names is not None:
-                                logger.debug(f"Parameter {clean_name} (tried: {possible_names}) not found in vLLM model, skipping")
-
-                        if weights_to_load:
-                            logger.info(f"Loading {len(weights_to_load)} parameters into vLLM model")
-                            logger.info(f"Sample parameter names being loaded: {[name for name, _ in weights_to_load[:5]]}")
-                            
-                            try:
-                                llm_model.load_weights(weights_to_load)
-                                logger.info(f"Successfully loaded {len(weights_to_load)} parameters into vLLM colocated model.")
-                            except Exception as e:
-                                logger.error(f"Failed to load weights into vLLM: {e}")
-                                # 실패 시 파라미터 이름 출력
-                                logger.error(f"Attempted to load parameters: {[name for name, _ in weights_to_load[:10]]}")
-                                raise
-                        else:
-                            logger.error("No weights to load into vLLM model!")
-                            logger.error("This suggests a parameter name mismatch between PEFT model and vLLM")
-                            # 디버깅을 위해 양쪽 파라미터 출력
-                            logger.error(f"PEFT parameters (first 10): {[name for name, _ in list(self.model.named_parameters())[:10]]}")
-                            if vllm_param_names:
-                                logger.error(f"vLLM parameters (first 10): {list(vllm_param_names)[:10]}")
-                    # if self.vllm_mode == "colocate":
-                    #     base_model = self.model.get_base_model()
-                    #     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-                    #     weights_to_load = []
-                    #     # DeepSpeed ZeRO-3 with PEFT
-                    #     for name, param in self.model.named_parameters():
-                    #         # clean_name = self._fix_param_name_to_vllm(
-                    #         #     name.replace("base_model.model.", "").replace("model.", "")
-                    #         # )
-                    #         # weights_to_load.append((clean_name, param.data.contiguous()))
-                    #                             # base_model.model. 제거
-                    #         clean_name = name.replace("base_model.model.", "")
-                    #         # model. prefix 제거 (중복 방지)
-                    #         if clean_name.startswith("model."):
-                    #             clean_name = clean_name[6:]  # "model." 제거
-                            
-                    #         # PEFT specific prefixes 제거
-                    #         clean_name = clean_name.replace(".base_layer", "")
-                            
-                    #         # modules_to_save prefix 처리
-                    #         if "modules_to_save.default." in clean_name:
-                    #             clean_name = clean_name.replace("modules_to_save.default.", "")
-                            
-                    #         # PEFT adapter parameters는 스킵
-                    #         if self.model.prefix in clean_name or "lora_" in clean_name:
-                    #             continue
-                            
-                    #         # original_module은 스킵
-                    #         if "original_module" in clean_name:
-                    #             continue
-                            
-                    #         # vLLM 모델 구조에 맞게 최종 매핑
-                    #         # LlamaForCausalLM의 경우: model.embed_tokens -> embed_tokens
-                    #         if clean_name == "embed_tokens.weight":
-                    #             vllm_name = "model.embed_tokens.weight"
-                    #         elif clean_name.startswith("layers."):
-                    #             vllm_name = f"model.{clean_name}"
-                    #         elif clean_name == "norm.weight":
-                    #             vllm_name = "model.norm.weight"
-                    #         elif clean_name == "lm_head.weight":
-                    #             vllm_name = "lm_head.weight"
-                    #         else:
-                    #             vllm_name = clean_name
-                            
-                    #         weights_to_load.append((vllm_name, param.data.contiguous()))
-
-                    #     if weights_to_load:
-                    #         llm_model.load_weights(weights_to_load)
-                    #         logger.info(f"Loaded {len(weights_to_load)} parameters into vLLM colocated model.")
-
-                    
-                    elif self.vllm_mode == "server" and self.accelerator.is_main_process:
-
-                        for name, param in self.model.named_parameters():
-                            # 위와 동일한 매핑 로직
-                            clean_name = name.replace("base_model.model.", "")
-                            if clean_name.startswith("model."):
-                                clean_name = clean_name[6:]
-                            
-                            clean_name = clean_name.replace(".base_layer", "")
-                            
-                            if "modules_to_save.default." in clean_name:
-                                clean_name = clean_name.replace("modules_to_save.default.", "")
-                            
-                            if self.model.prefix in clean_name or "lora_" in clean_name:
-                                continue
-                            
-                            if "original_module" in clean_name:
-                                continue
-                            
-                            # vLLM 매핑
-                            if clean_name == "embed_tokens.weight":
-                                vllm_name = "model.embed_tokens.weight"
-                            elif clean_name.startswith("layers."):
-                                vllm_name = f"model.{clean_name}"
-                            elif clean_name == "norm.weight":
-                                vllm_name = "model.norm.weight"
-                            elif clean_name == "lm_head.weight":
-                                vllm_name = "lm_head.weight"
-                            else:
-                                vllm_name = clean_name
-                        # for name, param in self.model.named_parameters():
-                        #     # When using PEFT, we need to recover the original parameter name and discard some parameters
-                        #     name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        #     if self.model.prefix in name:
-                        #         continue
-                        #     # When module to save, remove its prefix and discard the original module
-                        #     if "original_module" in name:
-                        #         continue
-                        #     name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-                        #     self.vllm_client.update_named_param(name, param.data)
-
-                            # if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            #     self.vllm_client.update_named_param(name, param.data)
-                            # elif self.vllm_mode == "colocate":
-                            #     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            #     llm_model.load_weights([(name, param.data)])
+                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                            self.vllm_client.update_named_param(name, param.data)
+                        elif self.vllm_mode == "colocate":
+                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                            llm_model.load_weights([(name, param.data)])
                 # Unmerge adapters while parameters are still gathered
                 self.model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
@@ -2472,6 +2264,13 @@ class ValSETrainer(BaseTrainer):
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
 
+            if "importance_sampling_ratio" in generation_batch:
+                for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
+                    zip(adapter_names, adapter_boundaries)
+                ):
+                    if adapter_name in generation_batch["importance_sampling_ratio"]:
+                        generation_batch["importance_sampling_ratio_vllm"] = generation_batch["importance_sampling_ratio"][adapter_name]
+
             adapter_old_logps = old_per_token_logps[start_index:end_index] if old_per_token_logps is not None else None
             adapter_sampling_logps = sampling_per_token_logps[start_index:end_index] if sampling_per_token_logps is not None else None
             adapter_completion_mask = completion_mask[start_index:end_index]
@@ -2654,7 +2453,11 @@ class ValSETrainer(BaseTrainer):
             per_token_loss = per_token_loss * entropy_mask
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
-            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+            adapter_name = inputs["adapter_info"]["adapter_names"][0]
+            if "importance_sampling_ratio_vllm" in inputs:
+                per_token_loss = per_token_loss * inputs["importance_sampling_ratio_vllm"]
+            elif "importance_sampling_ratio" in inputs:
+                per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
