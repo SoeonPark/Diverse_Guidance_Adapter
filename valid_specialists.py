@@ -141,7 +141,7 @@ else:
 
 
 logger = logging.get_logger(__name__)
-logging.getLogger("vllm").setLevel(logging.WARNING)
+logging.get_logger("vllm").setLevel(logging.WARNING)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -279,34 +279,7 @@ class ValSETrainer(BaseTrainer):
             else:
                 self.reward_func_names_diversity.append(reward_funcs_diversity[i].__name__)
         self.reward_funcs_diversity = reward_funcs_diversity
-        # self.reward_func_names.extend(self.reward_funcs_diversity)
-
-        # self.reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
-
-        # breakpoint()
-
-        # Set List of Adapter names to be used in this Trainer
-        # adapter_names = []
-        # if adapter_name is None:
-        #     self.adapter_names = ["default"]
-        #     self.num_generations_per_adapter = [args.num_generations_per_base_adapter]
-        #     self.reward_func_names = self.reward_func_names_correctness
-        # elif isinstance(adapter_name, str):
-        #     for adapter in range(args.num_guidance_adapters):
-        #         adapter_names.append(f"guidance_{adapter}")
-        #         self.num_generations_per_adapter = [args.num_generations_per_diversity_adapters]
-        #         self.reward_func_names = self.reward_func_names_diversity
-        # else:
-        #     self.adapter_names = list(adapter_name)
-        #     self.num_generations_per_adapter = []
-        #     self.reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
-        #     for adapter in self.adapter_names:
-        #         if adapter == "default":
-        #             self.num_generations_per_adapter.append(args.num_generations_per_base_adapter)
-        #         elif adapter.startswith("guidance_"):
-        #             self.num_generations_per_adapter.append(args.num_generations_per_diversity_adapter)
-        #         else:
-        #             self.num_generations_per_adapter.append(args.num_generations)
+        
         if adapter_name is None:
             adapter_list = ["default"]
             for i in range(args.num_guidance_adapters):
@@ -2337,13 +2310,12 @@ class ValSETrainer(BaseTrainer):
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
 
-            if "importance_sampling_ratio" in generation_batch:
-                for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
-                    zip(adapter_names, adapter_boundaries)
-                ):
-                    if adapter_name in generation_batch["importance_sampling_ratio"]:
-                        generation_batch["importance_sampling_ratio_vllm"] = generation_batch["importance_sampling_ratio"][adapter_name]
-
+            for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
+                zip(adapter_names, adapter_boundaries)
+            ):
+                if old_per_token_logps is None or sampling_per_token_logps is None:
+                    continue
+                
             adapter_old_logps = old_per_token_logps[start_index:end_index] if old_per_token_logps is not None else None
             adapter_sampling_logps = sampling_per_token_logps[start_index:end_index] if sampling_per_token_logps is not None else None
             adapter_completion_mask = completion_mask[start_index:end_index]
@@ -2355,7 +2327,7 @@ class ValSETrainer(BaseTrainer):
             )            
 
             delta = torch.abs(adapter_old_logps - adapter_sampling_logps)
-            delta = delta[completion_mask.bool()]
+            delta = delta[adapter_completion_mask.bool()]
             mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
             max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
             self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
@@ -2365,7 +2337,7 @@ class ValSETrainer(BaseTrainer):
                 self.accelerator.gather(max_delta).max().item()
             )
 
-            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
+            flat_is_ratio = importance_sampling_ratio[adapter_completion_mask.bool()]
             min_importance_sampling_ratio = (
                 torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
             )
@@ -2616,7 +2588,7 @@ class ValSETrainer(BaseTrainer):
             if not self._logs["prompt"] or not self._logs["completion"]:
                 return
             
-            breakpoint()
+            # breakpoint()
 
             # Check for the length of all Deque
             reward_lengths = [len(v) for v in self._logs["rewards"].values()] if self._logs["rewards"] else [0]
@@ -2630,7 +2602,7 @@ class ValSETrainer(BaseTrainer):
                 logger.warning("No completions to log.")
                 return
             
-            breakpoint()
+            # breakpoint()
 
             flattened_rewards = {}
             for key, values in self._logs["rewards"].items():
@@ -2653,17 +2625,17 @@ class ValSETrainer(BaseTrainer):
             if self.args.report_to and "trackio" in self.args.report_to:
                 logging_backends.append(trackio)
 
-            breakpoint()
+            # breakpoint()
 
             if logging_backends:
                 import pandas as pd
 
                 table = {
-                    "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
-                    "prompt": self._logs["prompt"],
-                    "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
+                    "step": [str(self.state.global_step)] * min_length,
+                    "prompt": list(self._logs["prompt"])[:min_length],
+                    "completion": list(self._logs["completion"])[:min_length],
+                    **flattened_rewards,
+                    "advantage": list(self._logs["advantages"])[:min_length],
                 }
 
                 df_base = pd.DataFrame(table)
