@@ -690,9 +690,61 @@ class ValSETrainer(BaseTrainer):
                         reward_func, evaluation_mode=True, device_placement=True
                     )
     
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """Save all adapters separately."""
+        checkpoint_folder = f"{self.args.output_dir}/checkpoint-{self.state.global_step}"
+        os.makedirs(checkpoint_folder, exist_ok=True)
+        
+        # Save each adapter
+        for adapter_name in self.adapter_names:
+            adapter_path = f"{checkpoint_folder}/{adapter_name}"
+            model.set_adapter(adapter_name)
+            model.save_pretrained(
+                adapter_path,
+                save_adapter=True,
+                save_config=True,
+                safe_serialization=True
+            )
+            print(f"  >> Saved adapter '{adapter_name}' to {adapter_path}")
+        
+        # Save training state
+        super()._save_checkpoint(model, trial, metrics)
+
+    
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """
+        Override to save final model with all adapters.
+        
+        Called at the end of training via trainer.train().
+        """
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if is_peft_available() and isinstance(self.model, PeftModel):
+            # Save each adapter
+            for adapter_name in self.adapter_names:
+                adapter_path = os.path.join(output_dir, adapter_name)
+                os.makedirs(adapter_path, exist_ok=True)
+                
+                self.model.set_adapter(adapter_name)
+                self.model.save_pretrained(
+                    adapter_path,
+                    save_adapter=True,
+                    save_config=True,
+                    safe_serialization=True
+                )
+                if self.accelerator.is_main_process:
+                    print(f"  >> [Final Model] Saved adapter '{adapter_name}' to {adapter_path}")
+            
+            # Also save the base model config (once)
+            if self.accelerator.is_main_process:
+                self.model.config.save_pretrained(output_dir)
+        else:
+            # For non-PEFT models, use default save
+            super().save_model(output_dir, _internal_call)
+
     # [Not originally in GRPO] In transformers.Trainer:
     # Not Modified yet
-
     def training_step(
         self,
         model: nn.Module,
@@ -744,23 +796,35 @@ class ValSETrainer(BaseTrainer):
 
             # For the case 'inference mode' oronly use one adapter
             if adapter_batches is None:
-                with self.compute_loss_context_manager():
-                    loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
-                if self.args.n_gpu > 1:
-                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
-                if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
-                    loss = loss / self.current_gradient_accumulation_steps
-
-                kwargs = {}
-                if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-                    kwargs["learning_rate"] = self._get_learning_rate()
-
-                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-                    kwargs["scale_wrt_gas"] = False
+                for adapter_index, adapter_inputs in enumerate(adapter_batches):
+                    adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
+                    
+                    # Set adapter
+                    if is_peft_available() and isinstance(model, PeftModel):
+                        model.set_adapter(adapter_name)
+                        print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
                 
-                self.accelerator.backward(loss, **kwargs)
-                total_loss = loss.detach()
+                    advantages_per_adapter = adapter_inputs["advantages"]
+                    print(f"  >> [Training Step] Advantages shape: {advantages_per_adapter.shape} | Mean: {advantages_per_adapter.mean().item():.4f} | Std: {advantages_per_adapter.std().item():.4f}")
+                    print(f"  >> [Training Step] Inputs keys: {list(adapter_inputs.keys())}")
+                
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
+                    if self.args.n_gpu > 1:
+                        loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+                    if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+                        loss = loss / self.current_gradient_accumulation_steps
+
+                    kwargs = {}
+                    if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                        kwargs["learning_rate"] = self._get_learning_rate()
+
+                    if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        kwargs["scale_wrt_gas"] = False
+                    
+                    self.accelerator.backward(loss, **kwargs)
+                    total_loss = loss.detach()
 
             else:
                 # For the case 'training mode' with MULTIPLE adapters
@@ -814,6 +878,12 @@ class ValSETrainer(BaseTrainer):
                                 torch.mps.empty_cache()
                             else:
                                 torch.cuda.empty_cache()
+
+            print(f"\n=== [Adapter ({adapter_name})] Gradient Check ===")
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    print(f"Param: {name} | Grad Norm: {param.grad.norm().item():.6f}")
+            print("====================================\n")
             
             return total_loss
 
@@ -2268,8 +2338,9 @@ class ValSETrainer(BaseTrainer):
             self.accelerator.process_index * completions_per_process,
             (self.accelerator.process_index + 1) * completions_per_process,
         )
-        all_process_advantages = all_advantages.clone()  # keep the aggregated advantages for logging
-        advantages = all_advantages[process_slice]
+        all_process_advantages = self.accelerator.gather(all_advantages)
+        # all_process_advantages = all_advantages.clone()  # keep the aggregated advantages for logging
+        # advantages = all_advantages[process_slice]
         # breakpoint()
 
         self._metrics[mode]["reward"].append(rewards.mean().item())
@@ -2281,7 +2352,6 @@ class ValSETrainer(BaseTrainer):
         self._logs["completion"].extend(gather_object(completions_text))
         # breakpoint()
 
-        gathered_rewards_dict = {}
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
@@ -2303,7 +2373,6 @@ class ValSETrainer(BaseTrainer):
             # breakpoint()
         
         if not isinstance(self._logs["advantages"], deque):
-
             self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
         self._logs["advantages"].extend(all_process_advantages.tolist())
         # breakpoint()
