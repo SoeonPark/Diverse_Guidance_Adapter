@@ -1304,6 +1304,7 @@ class ValSETrainer(BaseTrainer):
                 for key in scored_outputs.keys():
                     if isinstance(scored_outputs[key], torch.Tensor):
                         print(f"  >> scored_outputs['{key}']: {scored_outputs[key].shape} {scored_outputs[key].dtype}")
+                        # breakpoint()
                     elif isinstance(scored_outputs[key], list):
                         print(f"  >> scored_outputs['{key}']: List of length {len(scored_outputs[key])}")
                     if key == "num_items_in_batch" or key == "all_extra_fields":
@@ -1325,13 +1326,15 @@ class ValSETrainer(BaseTrainer):
                 # breakpoint()
 
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
-                    # breakpoint()
+                    breakpoint()
                     adapter_data = {}
                     adv_index = 0
                     for key, value in scored_outputs.items():
-                        if key == "advantages" or key == "old_per_token_logps":
+                        if key == "advantages":
                             # advantages are already repeated per generation
-                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)]
+                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                        elif key == "old_per_token_logps":
+                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
                         elif key == "num_items_in_batch":
                             pass
                         # elif key == "all_extra_fields":
@@ -1341,14 +1344,12 @@ class ValSETrainer(BaseTrainer):
                                 if len(value) > 0:
                                     sliced_val = value[start_index:end_index]
                                     if len(sliced_val) == (end_index - start_index):
-                                        adapter_data[key] = sliced_val
-                            # if isinstance(value, torch.Tensor) and value.size(0) > 0:
-                            #     adapter_data[key] = value[start_index:end_index]
-                            # elif isinstance(value, list) and len(value) > 0:
-                            #     adapter_data[key] = value[start_index:end_index]
-                            # else:
-                            #     adapter_data[key] = value[start_index:end_index]
-                        # breakpoint()
+                                        if isinstance(sliced_val, torch.Tensor):
+                                            adapter_data[key] = sliced_val.detach()
+                                        else:
+                                            adapter_data[key] = sliced_val
+                        
+                        adv_index
                     
                     adapter_data = split_pixel_values_by_grid(adapter_data)
                     # breakpoint()
@@ -1536,7 +1537,7 @@ class ValSETrainer(BaseTrainer):
             with profiling_context(self, f"reward_func_diversity.{reward_func_name}"):
                 # breakpoint()
                 if isinstance(reward_func, nn.Module): # Module (no PretrainedModel) for compat with compiled models
-                    all_similarities = []
+                    all_avg_similarities = []
 
                     for curr_index, (curr_prompt, curr_completion) in enumerate(zip(prompts, completions)):
                         print(f"  >> [Diversity Reward] Comparing {curr_index}/{len(completions)} completions against {num_others} other completions.")
@@ -1570,10 +1571,12 @@ class ValSETrainer(BaseTrainer):
                                 similarities.append(similarity.item())
                                 # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
 
-                            all_similarities.append(similarities)
+                            all_avg_similarities.append(similarities)
                             # breakpoint()
 
-                        rewards_per_func[:, i] = torch.tensor(all_similarities, dtype = torch.float32, device = device)
+                        avg_similarity = sum(similarities) / len(similarities) if similarities else 0.0
+                        all_avg_similarities.append(avg_similarity)
+                    rewards_per_func[:, i] = torch.tensor(all_avg_similarities, dtype = torch.float32, device = device)
 
                 else: # For the case not using nn.Module reward functions
                     print(f"  >> Compare using non-module diversity reward function: {reward_func_name}")
@@ -2210,33 +2213,75 @@ class ValSETrainer(BaseTrainer):
 
         total_completions = sum(num_generations_list)
 
+        # Calculate Correctness Rewards Once for ALL!!!!
         print(f"  >> [Scoring] Scoring Correctness for a Total of {total_completions} Completions from Each Adapter")
-
         all_correctness_rewards = self._calculate_rewards_correctness(
             inputs, prompts, completions, completion_ids_list
-        )
+        ).to(device)
+        # Shape: (num_generations, num_correctness_reward_funcs) e.g., (3, 1)
         # breakpoint()
 
         all_rewards_per_func = []
         all_advantages = []
-        # diversity_rewards_list = []
 
         for adapter_index, (adapter_name, num_generations, (start_index, end_index)) in enumerate(zip(adapter_names, num_generations_list, adapter_boundaries)):
-            # breakpoint()
-            adapter_correctness_rewards = all_correctness_rewards.to(device)
-            # Shape: (num_generations, num_correctness_reward_funcs) e.g., (3, 1)
-            
+            # breakpoint()            
             print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
 
             if adapter_name == "default":
-                rewards_per_func = adapter_correctness_rewards[start_index:end_index]
+                rewards_per_func = all_correctness_rewards[start_index:end_index]
                 # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
                 num_generations = self.args.num_generations
                 current_weights = self.reward_weights[:len(self.reward_funcs_correctness)].to(device)
+                rewards = (rewards_per_func * current_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
+
+                for i, reward_func_name in enumerate(reward_func_names):
+                    mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                    self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_rewards)
+                    std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+                    self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
+                    # breakpoint()
+
+                all_rewards_per_func.append(rewards_per_func) # list
+                    
+                # Compute Advantages
+                mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+                mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+
+                std_grouped_rewards = rewards.view(-1, num_generations).std(dim=1)
+                std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+
+                advantages = rewards - mean_grouped_rewards  # (N,)
                 # breakpoint()
 
+                if self.scale_rewards in ["group", "none"]: # group 
+                    # If self.scale_rewards = "none", we'll still log group level std
+                    std_grouped_rewards = rewards.view(-1, num_generations).std(dim=1)
+                    std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+                elif self.scale_rewards == "batch":
+                    # Compute global std
+                    std_grouped_rewards = rewards.std().expand_as(rewards)
+                else:
+                    raise ValueError(
+                        f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
+                    )
+
+                is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+                if self.scale_rewards != "none":
+                    # A_{Main}
+                    advantages = advantages / (std_grouped_rewards + 1e-4)
+
+                self._metrics[mode][f"reward/{adapter_name}"].append(rewards.mean().item())
+                self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_rewards.mean().item())
+                self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero.float().mean().item())
+
             elif adapter_name.startswith("guidance_"):
+                # Get current Adapter's Prompts and Completions
+                curr_prompts = prompts[start_index:end_index]
+                curr_completions = [completions[i] for i in range(start_index, end_index)]
+                curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
+
                 # For Guidance Adapters (Correctenss + Diversity)
                 other_indices = list(range(start_index)) + list(range(end_index, total_completions))
                 other_adapter_data = {
@@ -2246,12 +2291,6 @@ class ValSETrainer(BaseTrainer):
                     "sampling_per_token_logps": sampling_per_token_logps[other_indices] if sampling_per_token_logps is not None and len(other_indices) > 0 else None,
                 }
 
-                # Get current Adapter's Prompts and Completions
-                curr_prompts = prompts[start_index:end_index]
-                # breakpoint()
-                curr_completions = [completions[i] for i in range(start_index, end_index)]
-                curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
-
                 # Calculate Diversity Rewards
                 diversity_rewards = self._calculate_rewards_diversity(
                     inputs, curr_prompts, curr_completions, curr_completion_ids_list,
@@ -2260,87 +2299,98 @@ class ValSETrainer(BaseTrainer):
                 # Shape: (num_generations, num_diversity_reward_funcs) e.g., (3, 2)
                 # breakpoint()
                 if self.args.masking_diversity_by_correctness:
-                    correctness_mask = (adapter_correctness_rewards[start_index:end_index] > 0.0).float() # (N, 1)
+                    correctness_mask = (all_correctness_rewards[start_index:end_index] > 0.0).float() # (N, 1)
                     diversity_rewards = diversity_rewards * correctness_mask
 
-                rewards_per_func = torch.cat([adapter_correctness_rewards[start_index:end_index], diversity_rewards], dim = 1)
-
+                rewards_per_func = torch.cat([all_correctness_rewards[start_index:end_index], diversity_rewards], dim = 1)
                 reward_func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
 
-                current_weights = torch.cat([
-                    self.reward_weights[:len(self.reward_funcs_correctness)].to(device),
-                    torch.ones(len(self.reward_funcs_diversity), dtype=torch.float32, device=device)
-                ]).to(device)
+                for i, reward_func_name in enumerate(reward_func_names):
+                    mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                    self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_rewards)
+                    std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+                    self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
+                    # breakpoint()
+
+                all_rewards_per_func.append(rewards_per_func) # list
+
+                # Compute Advantages
+                ## A_Correctness
+                cor_weights = self.reward_weights[:len(self.reward_funcs_correctness)].to(device)
+                correctness_rewards_weighted = (all_correctness_rewards[start_index:end_index] * cor_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
+
+                mean_grouped_correctness = correctness_rewards_weighted.view(-1, num_generations).mean(dim=1)
+                mean_grouped_correctness = mean_grouped_correctness.repeat_interleave(num_generations, dim=0)
+
+                advantages_correctness = correctness_rewards_weighted - mean_grouped_correctness
+
+                if self.scale_rewards in ["group", "none"]: # group 
+                    # If self.scale_rewards = "none", we'll still log group level std
+                    std_grouped_rewards = correctness_rewards_weighted.view(-1, num_generations).std(dim=1)
+                    std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+                elif self.scale_rewards == "batch":
+                    # Compute global std
+                    std_grouped_rewards = rewards.std().expand_as(rewards)
+                else:
+                    raise ValueError(
+                        f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
+                    )
+                
+                is_std_zero_cor = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+                if self.scale_rewards != "none":
+                    advantages = advantages_correctness / (std_grouped_rewards + 1e-4)
+                
+
+                ## A_Diversity
+                div_weights = torch.ones(len(self.reward_funcs_diversity), dtype=torch.float32).to(device)
+                diversity_rewards_weighted = (diversity_rewards * div_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
+
+                mean_grouped_diversity = diversity_rewards_weighted.view(-1, num_generations).mean(dim=1)
+                mean_grouped_diversity = mean_grouped_diversity.repeat_interleave(num_generations, dim=0)
+
+                advantages_diversity = diversity_rewards_weighted - mean_grouped_diversity
+
+                if self.scale_rewards in ["group", "none"]:
+                    # If self.scale_rewards = "none", we'll still log group level std
+                    std_grouped_diversity = diversity_rewards_weighted.view(-1, num_generations).std(dim=1)
+                    std_grouped_diversity = std_grouped_diversity.repeat_interleave(num_generations, dim=0)
+                elif self.scale_rewards == "batch":
+                    # Compute global std
+                    std_grouped_diversity = diversity_rewards_weighted.std().expand_as(rewards)
+                else:
+                    raise ValueError(
+                        f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
+                    )
+                # breakpoint()
+
+                is_std_zero_div = torch.isclose(std_grouped_diversity, torch.zeros_like(std_grouped_diversity))
+                if self.scale_rewards != "none":
+                    advantages_diversity = advantages / (std_grouped_diversity + 1e-4)
                     
+                # Combine Advantages (A_{Specialist} = w1 * A_{Correctness} + w2 * A_{Diversity})
+                advantages = (self.args.correctness_weight_for_specialist * advantages_correctness) + (self.args.diversity_weight_for_specialist * advantages_diversity)
+
+                # breakpoint()
+
+                self._metrics[mode][f"reward/{adapter_name}"].append(all_correctness_rewards[start_index:end_index].mean().item())
+                self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_rewards.mean().item())
+                self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero_cor.float().mean().item())
+                self._metrics[mode][f"reward/{adapter_name}"].append(diversity_rewards.mean().item())
+                self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_diversity.mean().item())
+                self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero_div.float().mean().item())
+
             else:
                 raise ValueError(f"Unknown adapter name: {adapter_name}")
             
             # breakpoint()
-
-            for i, reward_func_name in enumerate(reward_func_names):
-                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_rewards)
-                std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_func_rewards)
-                # breakpoint()
-
-            # 여기까진 괜찮은 것 같음
-            rewards = (rewards_per_func * current_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
-            all_rewards_per_func.append(rewards_per_func) # list
-
-            # breakpoint()
-            # Apply reward weight and Compute advantages
-            # Apply reward weights
-            mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
-            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
-            advantages = rewards - mean_grouped_rewards
-
-            if self.scale_rewards in ["group", "none"]: # group 
-                # If self.scale_rewards = "none", we'll still log group level std
-                std_rewards = rewards.view(-1, num_generations).std(dim=1)
-                std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
-            elif self.scale_rewards == "batch":
-                # Compute global std
-                std_rewards = rewards.std().expand_as(rewards)
-            else:
-                raise ValueError(
-                    f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
-                )
-
-            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-            if self.scale_rewards != "none":
-                advantages = advantages / (std_rewards + 1e-4)
-
             all_advantages.append(advantages)
-
-            self._metrics[mode][f"reward/{adapter_name}"].append(rewards.mean().item())
-            self._metrics[mode][f"reward_std/{adapter_name}"].append(std_rewards.mean().item())
-            self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero.float().mean().item())
-
-        # breakpoint()
-        # Concatenate all advantages from different adapters
+        
         all_advantages = torch.cat(all_advantages, dim=0)  # (total_completions,)
-
-        # Slice for Distributed Training
-        completions_per_process = all_advantages.size(0) #(total_completions + self.args.num_guidance_adapters * self.args.num_generations_per_diversity_adapters) // self.accelerator.num_processes
-        process_slice = slice(
-            self.accelerator.process_index * completions_per_process,
-            (self.accelerator.process_index + 1) * completions_per_process,
-        )
-        all_process_advantages = all_advantages.clone()  # keep the aggregated advantages for logging
-        advantages = all_advantages[process_slice]
-        # breakpoint()
-
-        self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
         self._logs["completion"].extend(gather_object(completions_text))
-        # breakpoint()
 
-        gathered_rewards_dict = {}
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
@@ -2362,9 +2412,8 @@ class ValSETrainer(BaseTrainer):
             # breakpoint()
         
         if not isinstance(self._logs["advantages"], deque):
-
             self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
-        self._logs["advantages"].extend(all_process_advantages.tolist())
+        self._logs["advantages"].extend(all_advantages.tolist())
         # breakpoint()
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -2375,49 +2424,49 @@ class ValSETrainer(BaseTrainer):
                 if old_per_token_logps is None or sampling_per_token_logps is None:
                     continue
                 
-            adapter_old_logps = old_per_token_logps[start_index:end_index] if old_per_token_logps is not None else None
-            adapter_sampling_logps = sampling_per_token_logps[start_index:end_index] if sampling_per_token_logps is not None else None
-            adapter_completion_mask = completion_mask[start_index:end_index]
+                adapter_old_logps = old_per_token_logps[start_index:end_index] if old_per_token_logps is not None else None
+                adapter_sampling_logps = sampling_per_token_logps[start_index:end_index] if sampling_per_token_logps is not None else None
+                adapter_completion_mask = completion_mask[start_index:end_index]
 
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            importance_sampling_ratio = torch.exp(adapter_old_logps - adapter_sampling_logps)
-            importance_sampling_ratio = torch.clamp(
-                importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-            )            
+                # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
+                importance_sampling_ratio = torch.exp(adapter_old_logps - adapter_sampling_logps)
+                importance_sampling_ratio = torch.clamp(
+                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                )            
 
-            delta = torch.abs(adapter_old_logps - adapter_sampling_logps)
-            delta = delta[adapter_completion_mask.bool()]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
+                delta = torch.abs(adapter_old_logps - adapter_sampling_logps)
+                delta = delta[adapter_completion_mask.bool()]
+                mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                    self.accelerator.gather(mean_delta).mean().item()
+                )
+                self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                    self.accelerator.gather(max_delta).max().item()
+                )
 
-            flat_is_ratio = importance_sampling_ratio[adapter_completion_mask.bool()]
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
+                flat_is_ratio = importance_sampling_ratio[adapter_completion_mask.bool()]
+                min_importance_sampling_ratio = (
+                    torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                )
+                mean_importance_sampling_ratio = (
+                    torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                )
+                max_importance_sampling_ratio = (
+                    torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                )
+                self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                    nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+                )
+                self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                    self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+                )
+                self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                    nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+                )
 
         # breakpoint()
-        generation_batch["advantages"] = advantages
+        generation_batch["advantages"] = all_advantages
         
         return generation_batch
 
