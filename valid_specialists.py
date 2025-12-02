@@ -567,11 +567,17 @@ class ValSETrainer(BaseTrainer):
         self.num_completions_to_print = args.num_completions_to_print
         # Keep logs sized to the generation batch to record only outputs from the latest model update.
         self._logs = {
+            # "images": deque(maxlen=args.generation_batch_size),
+            # "prompt": deque(maxlen=args.generation_batch_size),
+            # "completion": deque(maxlen=args.generation_batch_size),
+            # "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
+            # "advantages": deque(maxlen=args.generation_batch_size),
+            
             "images": deque(maxlen=args.generation_batch_size),
-            "prompt": deque(maxlen=args.generation_batch_size),
-            "completion": deque(maxlen=args.generation_batch_size),
+            "prompt": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
+            "completion": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
-            "advantages": deque(maxlen=args.generation_batch_size),
+            "advantages": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
         }
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
@@ -852,7 +858,19 @@ class ValSETrainer(BaseTrainer):
                     self.accelerator.backward(loss, **kwargs)
                     
                     total_loss += loss.detach()
-                    
+
+                    if self.accelerator.is_main_process:
+                        adapter_grads = []
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                adapter_grads.append(param.grad.norm().item())
+
+                        if adapter_grads:
+                            avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
+                            print(f"    >> [Adapter '{adapter_name}'] Average gradient norm: {avg_grad_norm:.6f}")
+                        else:
+                            print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
+                                                
                     del adapter_inputs
                     if self.args.torch_empty_cache_steps is not None:
                         if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
@@ -868,11 +886,6 @@ class ValSETrainer(BaseTrainer):
                                 torch.mps.empty_cache()
                             else:
                                 torch.cuda.empty_cache()
-
-                print(f"\n=== Adapter '{adapter_name}' Gradient Check ===")
-                for name, param in model.named_parameters():
-                    if adapter_name in name and param.grad is not None:
-                        print(f"  {name}: grad_norm={param.grad.norm().item():.6f}")
             
             return total_loss
 
@@ -1326,30 +1339,42 @@ class ValSETrainer(BaseTrainer):
                 # breakpoint()
 
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
-                    breakpoint()
+                    # breakpoint()
                     adapter_data = {}
                     adv_index = 0
                     for key, value in scored_outputs.items():
-                        if key == "advantages":
+                        if key in ["advantages", "old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps"]:
                             # advantages are already repeated per generation
-                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
-                        elif key == "old_per_token_logps":
-                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
-                        elif key == "num_items_in_batch":
+                            adapter_data[key] = value[start_index:end_index].detach()
+                        elif key in ["prompt_ids", "completion_ids", "completions_mask", "prompt_mask"]:
+                            if isinstance(value, torch.Tensor):
+                                adapter_data[key] = value[start_index:end_index].detach()
+                        elif key in ["num_items_in_batch", "adapter_info", "all_extra_fields"]:
                             pass
-                        # elif key == "all_extra_fields":
-                        #     pass
                         else:
-                            if isinstance(value, (torch.Tensor, list)):
-                                if len(value) > 0:
-                                    sliced_val = value[start_index:end_index]
-                                    if len(sliced_val) == (end_index - start_index):
-                                        if isinstance(sliced_val, torch.Tensor):
-                                            adapter_data[key] = sliced_val.detach()
-                                        else:
-                                            adapter_data[key] = sliced_val
-                        
-                        adv_index
+                            if isinstance(value, torch.Tensor) and value.size(0) > 0:
+                                adapter_data[key] = value[start_index:end_index]
+                            elif isinstance(value, list) and len(value) > 0:
+                                adapter_data[key] = value[start_index:end_index]
+
+                        # if key == "advantages":
+                        #     # advantages are already repeated per generation
+                        #     adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                        # elif key == "old_per_token_logps":
+                        #     adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                        # elif key == "num_items_in_batch":
+                        #     pass
+                        # # elif key == "all_extra_fields":
+                        # #     pass
+                        # else:
+                        #     if isinstance(value, (torch.Tensor, list)):
+                        #         if len(value) > 0:
+                        #             sliced_val = value[start_index:end_index]
+                        #             if len(sliced_val) == (end_index - start_index):
+                        #                 if isinstance(sliced_val, torch.Tensor):
+                        #                     adapter_data[key] = sliced_val
+                        #                 else:
+                        #                     adapter_data[key] = sliced_val
                     
                     adapter_data = split_pixel_values_by_grid(adapter_data)
                     # breakpoint()
@@ -2232,7 +2257,7 @@ class ValSETrainer(BaseTrainer):
                 rewards_per_func = all_correctness_rewards[start_index:end_index]
                 # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
-                num_generations = self.args.num_generations
+                num_generations = end_index - start_index
                 current_weights = self.reward_weights[:len(self.reward_funcs_correctness)].to(device)
                 rewards = (rewards_per_func * current_weights.unsqueeze(0)).nansum(dim=1)  # (N,)
 
@@ -2387,13 +2412,19 @@ class ValSETrainer(BaseTrainer):
         
         all_advantages = torch.cat(all_advantages, dim=0)  # (total_completions,)
 
-        # Log prompt and completion texts
-        self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["completion"].extend(gather_object(completions_text))
 
         for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
             zip(adapter_names, adapter_boundaries)
         ):
+            # Log prompt and completion texts per adapter
+            adapter_prompts = prompts_text[start_index:end_index]
+            adapter_completions = completions_text[start_index:end_index]
+            adapter_advantages = all_advantages[start_index:end_index]
+
+            self._logs["prompt"][adapter_name].extend(gather_object(adapter_prompts))
+            self._logs["completion"][adapter_name].extend(gather_object(adapter_completions))
+            self._logs["advantages"][adapter_name].extend(gather_object(adapter_advantages).tolist())
+
             # breakpoint()
             if adapter_name == "default":
                 func_names = self.reward_func_names_correctness
@@ -2411,9 +2442,9 @@ class ValSETrainer(BaseTrainer):
                 # breakpoint()
             # breakpoint()
         
-        if not isinstance(self._logs["advantages"], deque):
-            self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
-        self._logs["advantages"].extend(all_advantages.tolist())
+        # if not isinstance(self._logs["advantages"], deque):
+        #     self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
+        # self._logs["advantages"].extend(all_advantages.tolist())
         # breakpoint()
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -2693,81 +2724,86 @@ class ValSETrainer(BaseTrainer):
         self._metrics[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
+            
             if not self._logs["prompt"] or not self._logs["completion"]:
                 return
             
-            # breakpoint()
+            for adapter_name in self.adapter_names:
+                if adapter_name not in self._logs["prompt"] or not self._logs["prompt"][adapter_name]:
+                    continue
 
-            # Check for the length of all Deque
-            reward_lengths = [len(v) for v in self._logs["rewards"].values()] if self._logs["rewards"] else [0]
-            min_length = min(
-                len(self._logs["prompt"]), 
-                len(self._logs["completion"]), 
-                len(self._logs["advantages"]),
-                min(reward_lengths) if reward_lengths else 0
-            )
-            if min_length == 0:
-                logger.warning("No completions to log.")
-                return
-            
-            # breakpoint()
+                    # Check for the length of all Deque
+                    reward_keys = [k for k in self._logs["rewards"].keys() if k.startswith(adapter_name)]
+                    reward_lengths = [len(v) for v in self._logs["rewards"].values()] if self._logs["rewards"] else [0]
+                    min_length = min(
+                        len(self._logs["prompt"]), 
+                        len(self._logs["completion"]), 
+                        len(self._logs["advantages"]),
+                        min(reward_lengths) if reward_lengths else 0
+                    )
+                    if min_length == 0:
+                        logger.warning("No completions to log.")
+                        return
+                    
+                    # breakpoint()
 
-            flattened_rewards = {}
-            for key, values in self._logs["rewards"].items():
-                flattened_reward = key.replace("/", "_")
-                flattened_rewards[flattened_reward] = list(values)[:min_length]
+                    flattened_rewards = {}
+                    for key, values in self._logs["rewards"].items():
+                        flattened_reward = key.replace("/", "_")
+                        flattened_rewards[flattened_reward] = list(values)[:min_length]
 
-            if is_rich_available():
-                print_prompt_completions_sample(
-                    list(self._logs["prompt"])[:min_length],
-                    list(self._logs["completion"])[:min_length],
-                    flattened_rewards,
-                    list(self._logs["advantages"])[:min_length],
-                    self.state.global_step,
-                    self.num_completions_to_print,
-                )
+                    if is_rich_available():
+                        print_prompt_completions_sample(
+                            list(self._logs["prompt"])[:min_length],
+                            list(self._logs["completion"])[:min_length],
+                            flattened_rewards,
+                            list(self._logs["advantages"])[:min_length],
+                            self.state.global_step,
+                            self.num_completions_to_print,
+                        )
 
-            logging_backends = []
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                logging_backends.append(wandb)
-            if self.args.report_to and "trackio" in self.args.report_to:
-                logging_backends.append(trackio)
+                    logging_backends = []
+                    if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                        logging_backends.append(wandb)
+                    if self.args.report_to and "trackio" in self.args.report_to:
+                        logging_backends.append(trackio)
 
-            # breakpoint()
+                    # breakpoint()
 
-            if logging_backends:
-                import pandas as pd
+                    if logging_backends:
+                        import pandas as pd
 
-                table = {
-                    "step": [str(self.state.global_step)] * min_length,
-                    "prompt": list(self._logs["prompt"])[:min_length],
-                    "completion": list(self._logs["completion"])[:min_length],
-                    **flattened_rewards,
-                    "advantage": list(self._logs["advantages"])[:min_length],
-                }
+                        table = {
+                            "step": [str(self.state.global_step)] * min_length,
+                            "adapter": [adapter_name] * min_length,
+                            "prompt": list(self._logs["prompt"])[:min_length],
+                            "completion": list(self._logs["completion"])[:min_length],
+                            **flattened_rewards,
+                            "advantage": list(self._logs["advantages"])[:min_length],
+                        }
 
-                df_base = pd.DataFrame(table)
-                images_raw = self._logs["images"] or []
+                        df_base = pd.DataFrame(table)
+                        images_raw = self._logs["images"] or []
 
-                for logging_backend in logging_backends:
-                    if images_raw:
-                        # Convert images per backend and derive a dataframe that shares base columns
-                        if logging_backend is wandb:
-                            images = []
-                            for image_list in self._logs["images"]:
-                                images.append([wandb.Image(image) for image in image_list])
-                            df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
-                        elif logging_backend is trackio:
-                            # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
-                            logger.info("Skipping image logging for Trackio")
-                            df = df_base
-                    else:
-                        df = df_base
+                        for logging_backend in logging_backends:
+                            if images_raw:
+                                # Convert images per backend and derive a dataframe that shares base columns
+                                if logging_backend is wandb:
+                                    images = []
+                                    for image_list in self._logs["images"]:
+                                        images.append([wandb.Image(image) for image in image_list])
+                                    df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
+                                elif logging_backend is trackio:
+                                    # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
+                                    logger.info("Skipping image logging for Trackio")
+                                    df = df_base
+                            else:
+                                df = df_base
 
-                    if self.wandb_log_unique_prompts:
-                        df = df.drop_duplicates(subset=["prompt"])
+                            if self.wandb_log_unique_prompts:
+                                df = df.drop_duplicates(subset=["prompt"])
 
-                    logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                            logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
 
                 
 
