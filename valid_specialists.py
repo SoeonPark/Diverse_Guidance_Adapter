@@ -336,8 +336,8 @@ class ValSETrainer(BaseTrainer):
         
         if adapter_name is None:
             adapter_list = ["default"]
-            for i in range(args.num_guidance_adapters):
-                adapter_list.append(f"guidance_{i}")
+            for i in range(args.num_specialist_adapters):
+                adapter_list.append(f"specialist_{i}")
 
             self.adapter_names = adapter_list
 
@@ -352,7 +352,7 @@ class ValSETrainer(BaseTrainer):
         for name in self.adapter_names:
             if name == "default":
                 self.num_generations_per_adapter.append(args.num_generations_per_base_adapter)
-            elif name.startswith("guidance_"):
+            elif name.startswith("specialist_"):
                 self.num_generations_per_adapter.append(args.num_generations_per_diversity_adapters)
             else:
                 assert False, f"Unknown adapter name '{name}'"
@@ -867,10 +867,10 @@ class ValSETrainer(BaseTrainer):
 
                         if adapter_grads:
                             avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
-                            print(f"    >> [Adapter '{adapter_name}'] Average gradient norm: {avg_grad_norm:.6f}")
+                            print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Average gradient norm: {avg_grad_norm:.6f} | Param count: {len(adapter_grads)} | Min: {min(adapter_grads):.6f} | Max: {max(adapter_grads):.6f}")
                         else:
                             print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
-                                                
+
                     del adapter_inputs
                     if self.args.torch_empty_cache_steps is not None:
                         if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
@@ -1516,8 +1516,8 @@ class ValSETrainer(BaseTrainer):
         For each completion, we compare it against all completions from other adapters and take the MAXIMUM
         similarity score as the diversity reward (higher similarity = less diverse = higher reward for avoiding).
         
-        Example: With 10 total completions (4/3/3 from base/guidance1/guidance2):
-            - For 1 completion from guidance1: compare with 7 others (4 from base + 3 from guidance2)
+        Example: With 10 total completions (4/3/3 from base/specialist1/specialist2):
+            - For 1 completion from specialist1: compare with 7 others (4 from base + 3 from specialist2)
             - Diversity reward = max(similarity with those 7 completions)
         
         Args:
@@ -2301,7 +2301,7 @@ class ValSETrainer(BaseTrainer):
                 self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_rewards.mean().item())
                 self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero.float().mean().item())
 
-            elif adapter_name.startswith("guidance_"):
+            elif adapter_name.startswith("specialist_"):
                 # Get current Adapter's Prompts and Completions
                 curr_prompts = prompts[start_index:end_index]
                 curr_completions = [completions[i] for i in range(start_index, end_index)]
