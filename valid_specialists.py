@@ -1326,6 +1326,30 @@ class ValSETrainer(BaseTrainer):
                 """
                 (Pdb) scored_outputs.keys()
                 dict_keys(['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'num_items_in_batch', 'old_per_token_logps', 'ref_per_token_logps', 'sampling_per_token_logps', 'all_extra_fields', 'adapter_info', 'advantages'])
+                   
+                    >> [Scoring] Scoring Correctness for Completions from Adapter 'default' -- 4 generations(0:10)  
+                    >> [Scoring] Scoring Correctness for Completions from Adapter 'specialist_0' -- 3 generations(4:7)
+                    >> Using `reward_func_diversity`: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> [Scoring] Scoring Correctness for Completions from Adapter 'specialist_1' -- 3 generations(7:10)
+                    >> Using `reward_func_diversity`: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> Compare using non-module diversity reward function: bleu_score
+                    >> scored_outputs['prompt_ids']: torch.Size([10, 106]) torch.int64
+                    >> scored_outputs['prompt_mask']: torch.Size([10, 106]) torch.int64
+                    >> scored_outputs['completion_ids']: torch.Size([10, 820]) torch.int64
+                    >> scored_outputs['completion_mask']: torch.Size([10, 820]) torch.int64
+                    >> scored_outputs['num_items_in_batch']: torch.Size([]) torch.int64
+                        >> scored_outputs['num_items_in_batch']: 5368
+                    >> scored_outputs['old_per_token_logps']: torch.Size([16, 820]) torch.float16
+                    >> scored_outputs['ref_per_token_logps']: torch.Size([10, 820]) torch.float16
+                    >> scored_outputs['sampling_per_token_logps']: torch.Size([10, 820]) torch.float32
+                    >> scored_outputs['all_extra_fields']: List of length 3
+                        >> scored_outputs['all_extra_fields']: [{}, {}, {}]
+                    >> scored_outputs['advantages']: torch.Size([16]) torch.float32
                 """
 
                 adapter_info = scored_outputs["adapter_info"]
@@ -1338,46 +1362,33 @@ class ValSETrainer(BaseTrainer):
 
                 # breakpoint()
 
+                adv_index = 0
                 for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
                     # breakpoint()
                     adapter_data = {}
-                    adv_index = 0
                     for key, value in scored_outputs.items():
-                        if key in ["advantages", "old_per_token_logps", "ref_per_token_logps", "sampling_per_token_logps"]:
+                        if key == "advantages":
                             # advantages are already repeated per generation
-                            adapter_data[key] = value[start_index:end_index].detach()
-                        elif key in ["prompt_ids", "completion_ids", "completions_mask", "prompt_mask"]:
-                            if isinstance(value, torch.Tensor):
-                                adapter_data[key] = value[start_index:end_index].detach()
-                        elif key in ["num_items_in_batch", "adapter_info", "all_extra_fields"]:
+                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                        elif key == "old_per_token_logps":
+                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                        elif key == "num_items_in_batch":
+                            pass
+                        elif key == "all_extra_fields":
                             pass
                         else:
-                            if isinstance(value, torch.Tensor) and value.size(0) > 0:
-                                adapter_data[key] = value[start_index:end_index]
-                            elif isinstance(value, list) and len(value) > 0:
-                                adapter_data[key] = value[start_index:end_index]
-
-                        # if key == "advantages":
-                        #     # advantages are already repeated per generation
-                        #     adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
-                        # elif key == "old_per_token_logps":
-                        #     adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
-                        # elif key == "num_items_in_batch":
-                        #     pass
-                        # # elif key == "all_extra_fields":
-                        # #     pass
-                        # else:
-                        #     if isinstance(value, (torch.Tensor, list)):
-                        #         if len(value) > 0:
-                        #             sliced_val = value[start_index:end_index]
-                        #             if len(sliced_val) == (end_index - start_index):
-                        #                 if isinstance(sliced_val, torch.Tensor):
-                        #                     adapter_data[key] = sliced_val
-                        #                 else:
-                        #                     adapter_data[key] = sliced_val
+                            if isinstance(value, (torch.Tensor, list)):
+                                if len(value) > 0:
+                                    sliced_val = value[start_index:end_index]
+                                    if len(sliced_val) == (end_index - start_index):
+                                        if isinstance(sliced_val, torch.Tensor):
+                                            adapter_data[key] = sliced_val
+                                        else:
+                                            adapter_data[key] = sliced_val
+                    adv_index += (end_index - start_index)
                     
                     adapter_data = split_pixel_values_by_grid(adapter_data)
-                    # breakpoint()
+                    breakpoint()
                     adapter_data = shuffle_sequence_dict(adapter_data)
                     # generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                     adapter_data = unsplit_pixel_values_by_grid(adapter_data)
@@ -1395,6 +1406,7 @@ class ValSETrainer(BaseTrainer):
                     # adapter_batches = {**adapter_data, **adapter_metadata}
                     adapter_batches.append(adapter_inputs)
                 self._buffered_inputs = [{"adapter_batches":adapter_batches}]
+                # breakpoint()
 
             inputs = self._buffered_inputs[self._step % len(self._buffered_inputs)]
             self._step += 1
@@ -2781,13 +2793,13 @@ class ValSETrainer(BaseTrainer):
             image_sizes=inputs.get("image_sizes"),
             token_type_ids=inputs.get("token_type_ids"),
         )
+        # breakpoint()
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
         else:
             entropy_mask = None
 
-        adapter_name = inputs["adapter_info"]["adapter_names"][0]
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"]
