@@ -2359,7 +2359,7 @@ class ValSETrainer(BaseTrainer):
                                 
                                 print(f"  >> [Policy Distance] {adapter_name} vs default: KL = {kl_div.item():.4f}")
 
-            return output
+        return output
     
     def _score_completions(
             self, inputs: dict[str, Union[torch.Tensor, Any]], 
@@ -2894,11 +2894,13 @@ class ValSETrainer(BaseTrainer):
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         self._metrics[mode][f"entopy/{adapter_name}/mean"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
-        if self.args.log_detailed_entropy_info:
+        if self.args.log_detailed_entropy_info is True:
             position_entropy = (entropies * completion_mask).sum(0) / completion_token_count.clamp(min=1.0)
-            for pos, entropy_value in enumerate(position_entropy):
-                gathered_entropy_value = self.accelerator.gather(entropy_value)
-                self._metrics[mode][f"position_entropy/pos_{pos}"].append(gathered_entropy_value.nanmean().item())
+            mean_position_entropy = position_entropy.mean()
+            
+            gathered_mean = self.accelerator.gather(mean_position_entropy)
+            self._metrics[mode][f"detailed_entropy/{adapter_name}/mean"].append(gathered_mean.nanmean().item())
+            self._metrics[mode][f"detailed_entropy/{adapter_name}/std"].append(self.accelerator.gather(position_entropy.std()).nanmean().item())
 
         # start_index = end_index
 
@@ -2971,10 +2973,10 @@ class ValSETrainer(BaseTrainer):
                         advantages.append(adv.item())
                     else:
                         advantages.append(0.0)                    
-                breakpoint()
+                # breakpoint()
 
                 if is_rich_available():
-                    breakpoint()
+                    # breakpoint()
                     print_prompt_completions_sample(
                         list(self._logs["prompt"][adapter_name])[:min_length],
                         list(self._logs["completion"][adapter_name])[:min_length],
