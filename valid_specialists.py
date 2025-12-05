@@ -168,28 +168,6 @@ class ValSETrainer(BaseTrainer):
             }
             """),
     }
-
-
-    def _save_checkpoint(self, model, trial, metrics=None):
-        """Save all adapters separately."""
-        checkpoint_folder = f"{self.args.output_dir}/checkpoint-{self.state.global_step}"
-        os.makedirs(checkpoint_folder, exist_ok=True)
-        
-        # Save each adapter
-        for adapter_name in self.adapter_names:
-            adapter_path = f"{checkpoint_folder}/{adapter_name}"
-            model.set_adapter(adapter_name)
-            model.save_pretrained(
-                adapter_path,
-                save_adapter=True,
-                save_config=True,
-                safe_serialization=True
-            )
-            print(f"  >> Saved adapter '{adapter_name}' to {adapter_path}")
-        
-        # Save training state
-        super()._save_checkpoint(model, trial, metrics)
-
     
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """
@@ -856,6 +834,9 @@ class ValSETrainer(BaseTrainer):
                     
                     # Backward
                     self.accelerator.backward(loss, **kwargs)
+                    if self.accelerator.num_processes > 1:
+                        torch.distributed.barrier()
+                        print(f"    >> Barrier passed after adapter {adapter_index}")
                     
                     total_loss += loss.detach()
 
@@ -886,6 +867,12 @@ class ValSETrainer(BaseTrainer):
                                 torch.mps.empty_cache()
                             else:
                                 torch.cuda.empty_cache()
+
+                if self.accelerator.num_processes > 1:
+                    torch.distributed.barrier()
+                    print(f"  >> All adapters processed, barrier passed")
+
+            # breakpoint()
             
             return total_loss
 
@@ -1388,9 +1375,10 @@ class ValSETrainer(BaseTrainer):
                     adv_index += (end_index - start_index)
                     
                     adapter_data = split_pixel_values_by_grid(adapter_data)
-                    breakpoint()
+                    # breakpoint()
                     adapter_data = shuffle_sequence_dict(adapter_data)
-                    # generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                    # adapter_data = split_tensor_dict(adapter_data, self.args.steps_per_generation)
+                    # breakpoint()
                     adapter_data = unsplit_pixel_values_by_grid(adapter_data)
                     adapter_inputs = {
                         **adapter_data,
@@ -1406,6 +1394,7 @@ class ValSETrainer(BaseTrainer):
                     # adapter_batches = {**adapter_data, **adapter_metadata}
                     adapter_batches.append(adapter_inputs)
                 self._buffered_inputs = [{"adapter_batches":adapter_batches}]
+                print(f">>> Total buffered inputs: {len(self._buffered_inputs)}")
                 # breakpoint()
 
             inputs = self._buffered_inputs[self._step % len(self._buffered_inputs)]
@@ -2267,7 +2256,8 @@ class ValSETrainer(BaseTrainer):
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):  
                 all_old_per_token_logps = []
-                for start_index, end_index in adapter_boundaries:
+                for adapter_name, (start_index, end_index) in zip(self.adapter_names, adapter_boundaries):
+                    self.model.set_adapter(adapter_name)
                     old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.model,
                         prompt_completion_ids[start_index:end_index],
@@ -2284,6 +2274,7 @@ class ValSETrainer(BaseTrainer):
             # breakpoint()
 
             # Compute the per-token log probabilities for the reference model
+            print("  >> Computing Reference model log-probabilities...")
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
@@ -2451,6 +2442,7 @@ class ValSETrainer(BaseTrainer):
             print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
 
             if adapter_name == "default":
+                # breakpoint()
                 rewards_per_func = all_correctness_rewards[start_index:end_index]
                 # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
@@ -2466,13 +2458,11 @@ class ValSETrainer(BaseTrainer):
                     # breakpoint()
 
                 all_rewards_per_func.append(rewards_per_func) # list
+                # breakpoint()
                     
                 # Compute Advantages
                 mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
                 mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
-
-                std_grouped_rewards = rewards.view(-1, num_generations).std(dim=1)
-                std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
 
                 advantages = rewards - mean_grouped_rewards  # (N,)
                 # breakpoint()
@@ -2497,10 +2487,12 @@ class ValSETrainer(BaseTrainer):
                 self._metrics[mode][f"reward/{adapter_name}"].append(rewards.mean().item())
                 self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_rewards.mean().item())
                 self._metrics[mode][f"frac_reward_zero_std/{adapter_name}"].append(is_std_zero.float().mean().item())
+                
 
             elif adapter_name.startswith("specialist_"):
                 # Get current Adapter's Prompts and Completions
                 curr_prompts = prompts[start_index:end_index]
+                # breakpoint()
                 curr_completions = [completions[i] for i in range(start_index, end_index)]
                 curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
 
@@ -2588,7 +2580,8 @@ class ValSETrainer(BaseTrainer):
 
                 is_std_zero_div = torch.isclose(std_grouped_diversity, torch.zeros_like(std_grouped_diversity))
                 if self.scale_rewards != "none":
-                    advantages_diversity = advantages / (std_grouped_diversity + 1e-4)
+                    advantages_diversity = advantages_diversity / (std_grouped_diversity + 1e-4)
+                # breakpoint()
                     
                 # Combine Advantages (A_{Specialist} = w1 * A_{Correctness} + w2 * A_{Diversity})
                 advantages = (self.args.correctness_weight_for_specialist * advantages_correctness) + (self.args.diversity_weight_for_specialist * advantages_diversity)
@@ -2870,7 +2863,7 @@ class ValSETrainer(BaseTrainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-        total_loss += loss
+        # total_loss += loss
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
 
@@ -2916,9 +2909,9 @@ class ValSETrainer(BaseTrainer):
 
         # start_index = end_index
 
-        total_loss = total_loss / self.current_gradient_accumulation_steps
+        # total_loss = total_loss / self.current_gradient_accumulation_steps
 
-        return total_loss
+        return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         inputs = self._prepare_inputs(inputs)
@@ -3043,11 +3036,20 @@ class ValSETrainer(BaseTrainer):
 
                 
 
-    # Ensure the model card is saved along with the checkpoint
-    def _save_checkpoint(self, model, trial):
+    # Ensure the model card is saved along with the checkpoint(Modified)
+    def _save_checkpoint(self, model, trial, metrics=None):
+        checkpoint_folder = f"{self.args.output_dir}/checkpoint-{self.state.global_step}"
+        os.makedirs(checkpoint_folder, exist_ok=True)
+        for adapter_name in self.adapter_names:
+            adapter_path = f"{checkpoint_folder}/{adapter_name}"
+            model.set_adapter(adapter_name)
+            model.save_pretrained(adapter_path, save_adapter=True, save_config=True, safe_serialization=True)
+        
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
-        super()._save_checkpoint(model, trial)
+
+        super()._save_checkpoint(model, trial, metrics)
+
