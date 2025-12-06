@@ -13,362 +13,7 @@ from transformers import Trainer
 import datasets
 import pandas as pd
 import torch
-import torch.utils.dataimport os
-import subprocess
-import wandb
-
-# os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
-
-import torch
-from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import trl
-from trl import TrlParser, ModelConfig
-from typing import Dict, Any, Optional, List, Union, Callable, Tuple
-from dataclasses import dataclass
-import time
-
-# Custom imports
-from reward_func import (
-    format_reward_func,
-    extract_hash_answer,
-    correctness_reward_func,
-    levenstein_distance,
-    bert_score,
-    bleu_score
-)
-from data_utils import (
-    get_gsm8k_dataset, 
-    get_hf_math_dataset, 
-    get_anker_math_dataset, 
-    set_random_seed
-    )
-from custom_dgrpo_config import DGRPOConfig
-from custom_dgrpo_trainer import ValSETrainer 
-# from demo_trainer import DGRPOTrainer
-
-os.environ["ACCELERATE_USE_FSDP"] = "false"
-os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
-os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-
-from transformers import TrainerCallback
-import json
-from pathlib import Path
-from collections import defaultdict
-
-from transformers import TrainerCallback
-import json
-from pathlib import Path
-from collections import defaultdict
-
-class CustomCallback(TrainerCallback):
-    """
-    Save completions grouped by input prompt.
-    Each JSON file contains one prompt with all adapters' completions.
-    """
-    
-    def __init__(self, output_dir: str = "./completions"):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.completion_counter = 0
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        """Save completions grouped by input prompt."""
-        trainer = kwargs.get("trainer")
-        if trainer is None or not hasattr(trainer, '_logs'):
-            return
-        
-        if not trainer._logs.get("completion"):
-            return
-        
-        # Group completions by input prompt
-        input_grouped_data = self._group_by_input(trainer)
-        
-        # Save each input's completions
-        for input_data in input_grouped_data:
-            output_file = self.output_dir / f"input_{self.completion_counter:06d}_step_{state.global_step}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(input_data, f, indent=2, ensure_ascii=False)
-            
-            self.completion_counter += 1
-        
-        print(f"  >> Saved {len(input_grouped_data)} input-grouped completions to {self.output_dir}")
-    
-    def _group_by_input(self, trainer):
-        """
-        Group completions by input prompt.
-        
-        Returns:
-            List of dicts, each containing:
-            {
-                "prompt": "...",
-                "adapters": {
-                    "default": {
-                        "completions": [...],
-                        "rewards": {...},
-                        "advantages": [...]
-                    },
-                    "specialist_0": {...},
-                    ...
-                }
-            }
-        """
-        prompts = list(trainer._logs["prompt"])
-        completions = list(trainer._logs["completion"])
-        advantages = list(trainer._logs["advantages"])
-        rewards_dict = trainer._logs["rewards"]
-        
-        # Get adapter info
-        adapter_names = trainer.adapter_names
-        num_generations_list = trainer.num_generations_per_adapter
-        batch_size = len(prompts) // sum(num_generations_list)  # Original number of unique prompts
-        
-        # Initialize result structure
-        input_grouped = []
-        for prompt_idx in range(batch_size):
-            input_data = {
-                "prompt": None,  # Will be set from first occurrence
-                "global_step": trainer.state.global_step,
-                "epoch": trainer.state.epoch,
-                "adapters": {}
-            }
-            input_grouped.append(input_data)
-        
-        # Parse completions by adapter
-        global_idx = 0
-        for adapter_idx, (adapter_name, num_gens) in enumerate(zip(adapter_names, num_generations_list)):
-            for prompt_idx in range(batch_size):
-                # Set prompt (same across all adapters)
-                if input_grouped[prompt_idx]["prompt"] is None:
-                    input_grouped[prompt_idx]["prompt"] = prompts[global_idx]
-                
-                # Collect completions for this adapter
-                adapter_completions = []
-                adapter_advantages = []
-                adapter_rewards = defaultdict(list)
-                
-                for gen_idx in range(num_gens):
-                    curr_idx = global_idx + gen_idx
-                    adapter_completions.append(completions[curr_idx])
-                    adapter_advantages.append(advantages[curr_idx])
-                
-                # Extract rewards for this adapter
-                for key, values in rewards_dict.items():
-                    if key.startswith(f"{adapter_name}/"):
-                        reward_func_name = key.split("/", 1)[1]
-                        for gen_idx in range(num_gens):
-                            curr_idx = global_idx + gen_idx
-                            adapter_rewards[reward_func_name].append(list(values)[curr_idx])
-                
-                # Store adapter data
-                input_grouped[prompt_idx]["adapters"][adapter_name] = {
-                    "completions": adapter_completions,
-                    "advantages": adapter_advantages,
-                    "rewards": dict(adapter_rewards),
-                    "num_generations": num_gens
-                }
-                
-                global_idx += num_gens
-        
-        return input_grouped
-
-# Main function for training
-def main(dgrpo_config, model_config, args, use_vllm: Optional[bool] = True, vllm_mode = None) -> None:
-    # Set random seed for reproducibility
-    set_random_seed(dgrpo_config.seed)
-
-    output_dir = f"./checkpoints/{args.experiment_name}"
-    dgrpo_config.output_dir = output_dir
-    dgrpo_config.save_strategy = "steps" 
-    dgrpo_config.save_steps = 100  
-    dgrpo_config.save_total_limit = 3
-    dgrpo_config.logging_steps = 1
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token # We are going to use "Llama3"
-
-    # Load Dataset based on Configuration
-    if args.dataset_name == "gsm8k":
-        dataset = get_gsm8k_dataset(split=args.dataset_split)
-        reward_functions = {
-            "correctness": [
-                # format_reward_func,
-                correctness_reward_func
-            ]
-        }
-
-    elif args.dataset_name == "hf_math":
-        dataset = get_hf_math_dataset(split=args.dataset_split)
-        reward_functions = {
-            "correctness": [
-                # format_reward_func,
-                correctness_reward_func
-            ]
-        }
-    elif args.dataset_name == "anker_math":
-        dataset = get_anker_math_dataset(split=args.dataset_split)
-        reward_functions = {
-            "correctness": [
-                # format_reward_func,
-                correctness_reward_func,
-            ],
-            "diversity": [
-                # bert_score,
-                bleu_score
-            ]
-        }
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset_name}")
-    
-    # Set up Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 4bit Configuration >> But might not be used (will use the option, 'use_vllm')
-    bnb_config = BitsAndBytesConfig(
-        # load_in_4bit=True,
-        # bnb_4bit_use_double_quant=True,
-        # bnb_4bit_quant_type="nf4",
-        # bnb_4bit_compute_type=torch.float16
-
-        load_in_8bit=True,
-    )
-
-    # Load Pretrained Model
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        quantization_config=bnb_config,
-        trust_remote_code=True,
-        # torch_dtype=model_config.torch_dtype,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    )
-
-    # model.config.use_cache = False
-
-    # Configure LoRA for parameter-efficient fine-tuning
-    peft_config = LoraConfig(
-        r = model_config.lora_r,
-        lora_alpha = model_config.lora_alpha,
-        lora_dropout = model_config.lora_dropout,
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        task_type = "CAUSAL_LM"
-    )
-    
-    # model = prepare_model_for_kbit_training(model)
-    model = get_peft_model(model, peft_config)
-    print(model)
-    for i in range(dgrpo_config.num_specialist_adapters):
-        model.add_adapter(f"specialist_{i}", peft_config=peft_config)
-        print(f"  >> Num of Parameters after adding adapter specialist_{i}: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    print(model)
-    print(f"  >> Num of Parameters after PEFT: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    print(list(model.peft_config.keys()))
- 
-    ##### Test Cycle Before Training Starts #####
-    print(" ===== TEST CYCLE BEFORE TRAINING STARTS ===== ")
-
-    logits_stats = {}
-
-    test_samples = dataset.select(range(2))
-    inputs = tokenizer(
-        list(test_samples['problem']), 
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(model.device)
-    print(f" >> Main Adapter (Default) Activation Test ")
-    model.set_adapter("default")
-    print(f"  - Active Adapter: {model.active_adapters} ")
-    with torch.no_grad(): # No gradient calculation during testing
-        outputs = model(inputs['input_ids'], attention_mask=inputs['attention_mask'])
-
-    logits_default = outputs.logits
-    default_mean = torch.mean(logits_default).item()
-    logits_stats["default"] = default_mean
-    print(f"  >> 'default' Logits Shape: {logits_default.shape} ")
-    print(f"  >> 'default' Logits Mean: {default_mean} ")
-
-    for i in range(dgrpo_config.num_specialist_adapters):
-        adapter_name = f"specialist_{i}"
-        print(f" >> Guide Adapter {i} Activation Test ")
-        model.set_adapter(adapter_name)
-        print(f"  - Active Adapter: {model.active_adapters} ")
-        with torch.no_grad():
-            outputs = model(inputs['input_ids'], attention_mask=inputs['attention_mask'])
-        logits_guide = outputs.logits
-        specialist_mean = torch.mean(logits_guide).item()
-        logits_stats[adapter_name] = specialist_mean
-        print(f"  >> '{adapter_name}' Logits Shape: {logits_guide.shape} ")
-        print(f"  >> '{adapter_name}' Logits Mean: {specialist_mean} ")
-
-    print("  >> Current Active Adapter: ", model.active_adapters)
-
-    model.set_adapter("default")
-
-    print(" ===== END OF TEST CYCLE ===== ")
-    print("  >> Current Active Adapter: ", model.active_adapters)
-
-    print("  >> Adapters are Initialized and Ready for Training. ")
-    
-    # Set wandb setting
-    wandb.init(
-        project = f"DGRPO-{args.dataset_name}",
-        name = args.experiment_name,
-    )
-    completion_saver_callback = CustomCallback(output_dir=f"./completions/{args.experiment_name}")
-
-    # Initialize GRPO Trainer
-    trainer = ValSETrainer( # ValSETrainer(
-        args = dgrpo_config,
-        model = model,
-        train_dataset = dataset,
-        reward_funcs_correctness= reward_functions["correctness"],
-        reward_funcs_diversity= reward_functions["diversity"],
-        # reward_funcs = reward_functions,
-        # log_completions = True, #True, #False
-        callbacks=[completion_saver_callback],
-    )
-    print("  >> Training Arguments: ", trainer.args)
-
-    # Log Completions for each Adapter
-
-    trainer.train()
-
-    final_output_dir = f"{output_dir}/final_model"
-    trainer.save_model(final_output_dir)
-
-@dataclass
-class CustomArgument:
-    # num_specialist_adapters: int = 2
-    model_path: str = "meta-llama/Meta-Llama-3-8B-Instruct"
-    dataset_name: str = "anker_math"
-    dataset_split: str = "train"
-    experiment_name: str = f"dgrpo_experiment_{time.strftime('%Y%m%d_%H%M%S')}"
-
-    # output_dir: Optional[str] = None
-    # save_steps: int = 100
-    # save_total_limit: int = 3
-    # logging_steps: int = 10
-    # push_to_hub: bool = False
-    # hub_username: Optional[str] = None
-
-if __name__ == "__main__":    
-
-    parser = TrlParser((DGRPOConfig, ModelConfig, CustomArgument))
-    dgrpo_config, model_config, args = parser.parse_args_and_config()
-    dgrpo_config.num_generations = (dgrpo_config.num_specialist_adapters * dgrpo_config.num_generations_per_diversity_adapters) + dgrpo_config.num_generations_per_base_adapter
-    
-    dgrpo_config.save_strategy = "steps"
-
-    main(dgrpo_config, model_config, args, use_vllm=dgrpo_config.use_vllm)
-
-    # parser = TrlParser((DGRPOConfig, ModelConfig))
-    # grpo_config, model_config = parser.parse_args_and_config()
-    # main(grpo_config, model_config, use_vllm=grpo_config.use_vllm)
-
+import torch.utils.data
 import transformers
 from accelerate import logging
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
@@ -1092,6 +737,7 @@ class ValSETrainer(BaseTrainer):
         inputs: dict[str, Union[torch.Tensor, Any]],
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+    
         """
         Perform a training step on a batch of inputs.
 
@@ -1110,7 +756,7 @@ class ValSETrainer(BaseTrainer):
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         # Prepare buffers for context parallelism
-        # breakpoint()
+        breakpoint()
 
         cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
 
@@ -1189,9 +835,6 @@ class ValSETrainer(BaseTrainer):
                     
                     # Backward
                     self.accelerator.backward(loss, **kwargs)
-                    if self.accelerator.num_processes > 1:
-                        torch.distributed.barrier()
-                        print(f"    >> Barrier passed after adapter {adapter_index}")
                     
                     total_loss += loss.detach()
 
@@ -1206,6 +849,7 @@ class ValSETrainer(BaseTrainer):
                             print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Average gradient norm: {avg_grad_norm:.6f} | Total Param count: {len(adapter_grads)} | Min: {min(adapter_grads):.6f} | Max: {max(adapter_grads):.6f}")
                         else:
                             print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
+                        # 여기까지는 출력 나온거 확인함
 
                     del adapter_inputs
                     if self.args.torch_empty_cache_steps is not None:
@@ -1223,12 +867,6 @@ class ValSETrainer(BaseTrainer):
                             else:
                                 torch.cuda.empty_cache()
 
-                if self.accelerator.num_processes > 1:
-                    torch.distributed.barrier()
-                    print(f"  >> All adapters processed, barrier passed")
-
-            # breakpoint()
-            
             return total_loss
 
     def _set_signature_columns_if_needed(self):
@@ -1644,11 +1282,11 @@ class ValSETrainer(BaseTrainer):
 
         mode = "train" if self.model.training else "eval"
         if mode == "train":
-            generate_every = self.args.steps_per_generation * self.num_iterations
+            generate_every = self.args.steps_per_generation * self.num_iterations # 1
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 original_inputs = generation_batch
 
-                print(original_inputs)
+                print(f"  >> Original Inputs: {original_inputs}")
                 print(f">>> [Generation Step] Generating completions for step {self._step}/{generate_every}...")
                 print(self.args.steps_per_generation)
                 # breakpoint()
@@ -1762,6 +1400,121 @@ class ValSETrainer(BaseTrainer):
             inputs = self._generate_completions(generation_batch)
             inputs = self._score_completions(original_inputs, inputs)
         return inputs
+
+    # def _prepare_inputs(
+    #     self, generation_batch: dict[str, Union[torch.Tensor, Any]]
+    # ) -> dict[str, Union[torch.Tensor, Any]]:
+    #     mode = "train" if self.model.training else "eval"
+        
+    #     if mode == "train":
+    #         generate_every = self.args.steps_per_generation * self.num_iterations
+    #         if self._step % generate_every == 0 or self._buffered_inputs is None:
+    #             original_inputs = generation_batch
+                
+    #             generation_batch = self._generate_completions(generation_batch)
+    #             scored_outputs = self._score_completions(original_inputs, generation_batch)
+
+    #             adapter_info = scored_outputs["adapter_info"]
+    #             adapter_boundaries = adapter_info["adapter_boundaries"]
+    #             num_items_in_batch = scored_outputs["num_items_in_batch"]
+                
+    #             # Non-sequence 
+    #             non_sequence_keys = ["num_items_in_batch", "adapter_info", "all_extra_fields"]
+    #             non_sequence_data = {k: scored_outputs.pop(k) for k in non_sequence_keys if k in scored_outputs}
+                
+    #             # Global pixel split
+    #             scored_outputs = split_pixel_values_by_grid(scored_outputs)
+                
+    #             # Per-adapter processing
+    #             adapter_split_cache = {}
+    #             adv_index = 0
+
+    #             for adapter_index, (start_index, end_index) in enumerate(adapter_boundaries):
+    #                 adapter_name = adapter_info["adapter_names"][adapter_index]
+
+    #                 # breakpoint()
+    #                 adapter_data = {}
+    #                 for key, value in scored_outputs.items():
+    #                     if key == "advantages":
+    #                         # advantages are already repeated per generation
+    #                         adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+    #                     elif key == "old_per_token_logps":
+    #                         adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+    #                     elif key == "num_items_in_batch":
+    #                         pass
+    #                     elif key == "all_extra_fields":
+    #                         pass
+    #                     else:
+    #                         if isinstance(value, (torch.Tensor, list)):
+    #                             if len(value) > 0:
+    #                                 sliced_val = value[start_index:end_index]
+    #                                 if len(sliced_val) == (end_index - start_index):
+    #                                     if isinstance(sliced_val, torch.Tensor):
+    #                                         adapter_data[key] = sliced_val
+    #                                     else:
+    #                                         adapter_data[key] = sliced_val
+    #                 adv_index += (end_index - start_index)
+                    
+    #                 # Shuffle
+    #                 adapter_data = shuffle_sequence_dict(adapter_data)
+                    
+    #                 # Split
+    #                 if (end_index - start_index) < self.args.steps_per_generation:
+    #                     splits = [adapter_data for _ in range(self.args.steps_per_generation)]
+    #                 else:
+    #                     splits = split_tensor_dict(adapter_data, self.args.steps_per_generation)
+                    
+    #                 # Unsplit each sub-batch
+    #                 unsplit_splits = []
+    #                 for sub_batch in splits:
+    #                     sub_batch = unsplit_pixel_values_by_grid(sub_batch)
+    #                     unsplit_splits.append(sub_batch)
+                    
+    #                 adapter_split_cache[adapter_name] = unsplit_splits
+                
+    #             # Restore global scored_outputs
+    #             scored_outputs = unsplit_pixel_values_by_grid(scored_outputs)
+    #             scored_outputs.update(non_sequence_data)
+                
+    #             # Build buffered inputs
+    #             self._buffered_inputs = []
+    #             for step_idx in range(self.args.steps_per_generation):
+    #                 adapter_batches = []
+                    
+    #                 for adapter_index, adapter_name in enumerate(adapter_info["adapter_names"]):
+    #                     sub_batch = adapter_split_cache[adapter_name][step_idx]
+                        
+    #                     batch_size = sub_batch["completion_ids"].size(0) if "completion_ids" in sub_batch else 0
+    #                     if batch_size == 0:
+    #                         continue
+                        
+    #                     adapter_inputs = {
+    #                         **sub_batch,
+    #                         "adapter_info": {
+    #                             "adapter_names": [adapter_name],
+    #                             "num_generations_per_adapter": [adapter_info["num_generations_per_adapter"][adapter_index]],
+    #                             "adapter_boundaries": [(0, batch_size)],
+    #                         },
+    #                         "num_items_in_batch": num_items_in_batch
+    #                     }
+                        
+    #                     adapter_batches.append(adapter_inputs)
+                    
+    #                 if adapter_batches:
+    #                     self._buffered_inputs.append({"adapter_batches": adapter_batches})
+                
+    #             print(f">>> Total buffered inputs: {len(self._buffered_inputs)}")
+
+    #         buffer_index = self._step % len(self._buffered_inputs)
+    #         inputs = self._buffered_inputs[buffer_index]
+    #         self._step += 1
+
+    #     else:
+    #         original_inputs = generation_batch
+    #         inputs = self._generate_completions(generation_batch)
+    #         inputs = self._score_completions(original_inputs, inputs)
+        
+    #     return inputs
     
     # Calculate Rewards (Correctness and Diversity)
     @profiling_decorator
@@ -2133,7 +1886,7 @@ class ValSETrainer(BaseTrainer):
                     if output_reward_func and len(output_reward_func) > 0:
                         similarities = output_reward_func  # [sim1, sim2, ...]
                         mean_similarity = sum(similarities) / len(similarities)
-                        diversity_score = -mean_similarity
+                        diversity_score = 1.0 -mean_similarity
                     else:
                         diversity_score = 0.0
                     
@@ -3278,10 +3031,8 @@ class ValSETrainer(BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
 
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
@@ -3295,33 +3046,40 @@ class ValSETrainer(BaseTrainer):
                 return
             
             for adapter_name in self.adapter_names:
+                # Check if this adapter has data
                 if adapter_name not in self._logs["prompt"] or not self._logs["prompt"][adapter_name]:
                     continue
 
-                # Check for the length of all Deque
+                # Get adapter-specific data
+                adapter_prompts = list(self._logs["prompt"][adapter_name])
+                adapter_completions = list(self._logs["completion"][adapter_name])
+                adapter_advantages = list(self._logs["advantages"][adapter_name])
+                
+                # Get reward keys for this adapter
                 reward_keys = [k for k in self._logs["rewards"].keys() if k.startswith(adapter_name)]
+                
+                # Compute min length
                 reward_lengths = [len(self._logs["rewards"][k]) for k in reward_keys] if reward_keys else [0]
                 min_length = min(
-                    len(self._logs["prompt"][adapter_name]), 
-                    len(self._logs["completion"][adapter_name]), 
-                    len(self._logs["advantages"][adapter_name]),
+                    len(adapter_prompts), 
+                    len(adapter_completions), 
+                    len(adapter_advantages),
                     min(reward_lengths) if reward_lengths else 0
                 )
-                if min_length == 0:
-                    logger.warning("No completions to log.")
-                    return
                 
-                # breakpoint()
-
+                if min_length == 0:
+                    logger.warning(f"No completions to log for adapter '{adapter_name}'.")
+                    continue
+                
+                # Flatten rewards
                 flattened_rewards = {}
                 for key in reward_keys:
                     flattened_reward = key.replace("/", "_")
                     flattened_rewards[flattened_reward] = list(self._logs["rewards"][key])[:min_length]
 
+                # Convert advantages to float
                 advantages = []
-                advantages = list(self._logs["advantages"][adapter_name])[:min_length]
-
-                for adv in advantages:
+                for adv in adapter_advantages[:min_length]:
                     if isinstance(adv, str):
                         try:
                             advantages.append(float(adv))
@@ -3332,27 +3090,25 @@ class ValSETrainer(BaseTrainer):
                     elif hasattr(adv, 'item'):  # torch.Tensor
                         advantages.append(adv.item())
                     else:
-                        advantages.append(0.0)                    
-                # breakpoint()
+                        advantages.append(0.0)
 
+                # Print sample
                 if is_rich_available():
-                    # breakpoint()
                     print_prompt_completions_sample(
-                        list(self._logs["prompt"][adapter_name])[:min_length],
-                        list(self._logs["completion"][adapter_name])[:min_length],
+                        adapter_prompts[:min_length],
+                        adapter_completions[:min_length],
                         flattened_rewards,
                         advantages,
                         self.state.global_step,
                         self.num_completions_to_print,
                     )
 
+                # Logging backends
                 logging_backends = []
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     logging_backends.append(wandb)
                 if self.args.report_to and "trackio" in self.args.report_to:
                     logging_backends.append(trackio)
-
-                # breakpoint()
 
                 if logging_backends:
                     import pandas as pd
@@ -3360,10 +3116,10 @@ class ValSETrainer(BaseTrainer):
                     table = {
                         "step": [str(self.state.global_step)] * min_length,
                         "adapter": [adapter_name] * min_length,
-                        "prompt": list(self._logs["prompt"])[:min_length],
-                        "completion": list(self._logs["completion"])[:min_length],
+                        "prompt": adapter_prompts[:min_length],
+                        "completion": adapter_completions[:min_length],
                         **flattened_rewards,
-                        "advantage": list(self._logs["advantages"])[:min_length],
+                        "advantage": advantages,
                     }
 
                     df_base = pd.DataFrame(table)
@@ -3371,14 +3127,12 @@ class ValSETrainer(BaseTrainer):
 
                     for logging_backend in logging_backends:
                         if images_raw:
-                            # Convert images per backend and derive a dataframe that shares base columns
                             if logging_backend is wandb:
                                 images = []
                                 for image_list in self._logs["images"]:
                                     images.append([wandb.Image(image) for image in image_list])
                                 df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
                             elif logging_backend is trackio:
-                                # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
                                 logger.info("Skipping image logging for Trackio")
                                 df = df_base
                         else:
@@ -3387,7 +3141,122 @@ class ValSETrainer(BaseTrainer):
                         if self.wandb_log_unique_prompts:
                             df = df.drop_duplicates(subset=["prompt"])
 
-                        logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                        logging_backend.log({f"completions{adapter_name}": logging_backend.Table(dataframe=df)})
+                        
+    # def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+    #     mode = "train" if self.model.training else "eval"
+    #     metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+
+    #     # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+    #     # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+    #     if mode == "eval":
+    #         metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+    #     logs = {**logs, **metrics}
+    #     super().log(logs, start_time)
+    #     self._metrics[mode].clear()
+
+    #     if self.accelerator.is_main_process and self.log_completions:
+            
+    #         if not self._logs["prompt"] or not self._logs["completion"]:
+    #             return
+            
+    #         for adapter_name in self.adapter_names:
+    #             if adapter_name not in self._logs["prompt"] or not self._logs["prompt"][adapter_name]:
+    #                 continue
+
+    #             # Check for the length of all Deque
+    #             reward_keys = [k for k in self._logs["rewards"].keys() if k.startswith(adapter_name)]
+    #             reward_lengths = [len(self._logs["rewards"][k]) for k in reward_keys] if reward_keys else [0]
+    #             min_length = min(
+    #                 len(self._logs["prompt"][adapter_name]), 
+    #                 len(self._logs["completion"][adapter_name]), 
+    #                 len(self._logs["advantages"][adapter_name]),
+    #                 min(reward_lengths) if reward_lengths else 0
+    #             )
+    #             if min_length == 0:
+    #                 logger.warning("No completions to log.")
+    #                 return
+                
+    #             # breakpoint()
+
+    #             flattened_rewards = {}
+    #             for key in reward_keys:
+    #                 flattened_reward = key.replace("/", "_")
+    #                 flattened_rewards[flattened_reward] = list(self._logs["rewards"][key])[:min_length]
+
+    #             advantages = []
+    #             advantages = list(self._logs["advantages"][adapter_name])[:min_length]
+    #             raw_advantages = list(self._logs["advantages"][adapter_name])[:min_length]
+    #             parsed_advantages = []
+
+    #             for adv in raw_advantages:
+    #                 if isinstance(adv, str):
+    #                     try:
+    #                         parsed_advantages.append(float(adv))
+    #                     except ValueError:
+    #                         parsed_advantages.append(0.0)
+    #                 elif isinstance(adv, (int, float)):
+    #                     parsed_advantages.append(float(adv))
+    #                 elif hasattr(adv, "item"):  # torch.Tensor
+    #                     parsed_advantages.append(adv.item())
+    #                 else:
+    #                     parsed_advantages.append(0.0)            
+    #             # breakpoint()
+
+    #             if is_rich_available():
+    #                 # breakpoint()
+    #                 print_prompt_completions_sample(
+    #                     list(self._logs["prompt"][adapter_name])[:min_length],
+    #                     list(self._logs["completion"][adapter_name])[:min_length],
+    #                     flattened_rewards,
+    #                     advantages,
+    #                     self.state.global_step,
+    #                     self.num_completions_to_print,
+    #                 )
+
+    #             logging_backends = []
+    #             if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+    #                 logging_backends.append(wandb)
+    #             if self.args.report_to and "trackio" in self.args.report_to:
+    #                 logging_backends.append(trackio)
+
+    #             # breakpoint()
+
+    #             if logging_backends:
+    #                 import pandas as pd
+
+    #                 table = {
+    #                     "step": [str(self.state.global_step)] * min_length,
+    #                     "adapter": [adapter_name] * min_length,
+    #                     "prompt": list(self._logs["prompt"])[:min_length],
+    #                     "completion": list(self._logs["completion"])[:min_length],
+    #                     **flattened_rewards,
+    #                     "advantage": list(self._logs["advantages"])[:min_length],
+    #                 }
+
+    #                 df_base = pd.DataFrame(table)
+    #                 images_raw = self._logs["images"] or []
+
+    #                 for logging_backend in logging_backends:
+    #                     if images_raw:
+    #                         # Convert images per backend and derive a dataframe that shares base columns
+    #                         if logging_backend is wandb:
+    #                             images = []
+    #                             for image_list in self._logs["images"]:
+    #                                 images.append([wandb.Image(image) for image in image_list])
+    #                             df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
+    #                         elif logging_backend is trackio:
+    #                             # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
+    #                             logger.info("Skipping image logging for Trackio")
+    #                             df = df_base
+    #                     else:
+    #                         df = df_base
+
+    #                     if self.wandb_log_unique_prompts:
+    #                         df = df.drop_duplicates(subset=["prompt"])
+
+    #                     logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
 
                 
 
@@ -3406,5 +3275,5 @@ class ValSETrainer(BaseTrainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
 
-        super()._save_checkpoint(model, trial, metrics)
+        super()._save_checkpoint(model, trial)
 
