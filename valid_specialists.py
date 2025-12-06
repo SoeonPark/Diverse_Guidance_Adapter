@@ -731,42 +731,157 @@ class ValSETrainer(BaseTrainer):
     # [Not originally in GRPO] In transformers.Trainer:
     # Not Modified yet
 
+    # def training_step(
+    #     self,
+    #     model: nn.Module,
+    #     inputs: dict[str, Union[torch.Tensor, Any]],
+    #     num_items_in_batch: Optional[torch.Tensor] = None,
+    # ) -> torch.Tensor:
+    
+    #     """
+    #     Perform a training step on a batch of inputs.
+
+    #     Subclass and override to inject custom behavior.
+
+    #     Args:
+    #         model (`nn.Module`):
+    #             The model to train.
+    #         inputs (`dict[str, Union[torch.Tensor, Any]]`):
+    #             The inputs and targets of the model.
+
+    #             The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+    #             argument `labels`. Check your model's documentation for all accepted arguments.
+
+    #     Return:
+    #         `torch.Tensor`: The tensor with training loss on this batch.
+    #     """
+    #     # Prepare buffers for context parallelism
+    #     # breakpoint()
+
+    #     cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+
+    #     # Context manager is no-op if CP isn't enabled
+    #     with cp_context():
+    #         model.train()
+    #         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+    #             self.optimizer.train()
+
+    #         # breakpoint()
+
+    #         inputs = self._prepare_inputs(inputs)
+
+    #         if is_sagemaker_mp_enabled():
+    #             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+    #             return loss_mb.reduce_mean().detach().to(self.args.device)
+
+    #         # adapter_names = inputs["adapter_info"]["adapter_names"]
+    #         # num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
+
+    #         total_loss = 0.0
+
+    #         adapter_batches = inputs.get("adapter_batches")
+
+    #         # For the case 'inference mode' oronly use one adapter
+    #         if adapter_batches is None:
+    #             with self.compute_loss_context_manager():
+    #                 loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
+    #             if self.args.n_gpu > 1:
+    #                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+    #             if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+    #                 loss = loss / self.current_gradient_accumulation_steps
+
+    #             kwargs = {}
+    #             if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+    #                 kwargs["learning_rate"] = self._get_learning_rate()
+
+    #             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+    #                 kwargs["scale_wrt_gas"] = False
+                
+    #             self.accelerator.backward(loss, **kwargs)
+    #             total_loss = loss.detach()
+
+    #         else:
+    #             # For the case 'training mode' with MULTIPLE adapters
+    #             for adapter_index, adapter_inputs in enumerate(adapter_batches):
+
+    #                 adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
+                    
+    #                 # Set adapter
+    #                 if is_peft_available() and isinstance(model, PeftModel):
+    #                     model.set_adapter(adapter_name)
+                    
+    #                 print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
+                    
+    #                 # Forward & Backward
+    #                 with self.compute_loss_context_manager():
+    #                     # breakpoint()
+    #                     loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+                    
+    #                 if self.args.n_gpu > 1:
+    #                     loss = loss.mean()
+                    
+    #                 # Normalize loss
+    #                 if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+    #                     if self.compute_loss_func is None:
+    #                         loss = loss / self.current_gradient_accumulation_steps
+                    
+    #                 kwargs = {}
+    #                 if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+    #                     kwargs["learning_rate"] = self._get_learning_rate()
+                    
+    #                 if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+    #                     kwargs["scale_wrt_gas"] = False
+                    
+    #                 # Backward
+    #                 self.accelerator.backward(loss, **kwargs)
+                    
+    #                 total_loss += loss.detach()
+
+    #                 if self.accelerator.is_main_process:
+    #                     adapter_grads = []
+    #                     for name, param in model.named_parameters():
+    #                         if param.grad is not None:
+    #                             adapter_grads.append(param.grad.norm().item())
+
+    #                     if adapter_grads:
+    #                         avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
+    #                         print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Average gradient norm: {avg_grad_norm:.6f} | Total Param count: {len(adapter_grads)} | Min: {min(adapter_grads):.6f} | Max: {max(adapter_grads):.6f}")
+    #                     else:
+    #                         print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
+    #                     # 여기까지는 출력 나온거 확인함
+
+    #                 del adapter_inputs
+    #                 if self.args.torch_empty_cache_steps is not None:
+    #                     if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
+    #                         if is_torch_xpu_available():
+    #                             torch.xpu.empty_cache()
+    #                         elif is_torch_mlu_available():
+    #                             torch.mlu.empty_cache()
+    #                         elif is_torch_musa_available():
+    #                             torch.musa.empty_cache()
+    #                         elif is_torch_npu_available():
+    #                             torch.npu.empty_cache()
+    #                         elif is_torch_mps_available():
+    #                             torch.mps.empty_cache()
+    #                         else:
+    #                             torch.cuda.empty_cache()
+
+    #         return total_loss
+
     def training_step(
         self,
         model: nn.Module,
         inputs: dict[str, Union[torch.Tensor, Any]],
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-    
-        """
-        Perform a training step on a batch of inputs.
-
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to train.
-            inputs (`dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-
-        Return:
-            `torch.Tensor`: The tensor with training loss on this batch.
-        """
-        # Prepare buffers for context parallelism
-        # breakpoint()
-
+        
         cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
 
-        # Context manager is no-op if CP isn't enabled
         with cp_context():
             model.train()
             if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
                 self.optimizer.train()
-
-            # breakpoint()
 
             inputs = self._prepare_inputs(inputs)
 
@@ -774,27 +889,26 @@ class ValSETrainer(BaseTrainer):
                 loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
                 return loss_mb.reduce_mean().detach().to(self.args.device)
 
-            # adapter_names = inputs["adapter_info"]["adapter_names"]
-            # num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
-
             total_loss = 0.0
-
             adapter_batches = inputs.get("adapter_batches")
 
-            # For the case 'inference mode' oronly use one adapter
             if adapter_batches is None:
                 with self.compute_loss_context_manager():
-                    loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
+                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                
                 if self.args.n_gpu > 1:
-                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                    loss = loss.mean()
 
-                if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
-                    loss = loss / self.current_gradient_accumulation_steps
+                # DeepSpeed handles scaling internally, so check before manual scaling
+                if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+                    if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+                        loss = loss / self.current_gradient_accumulation_steps
 
                 kwargs = {}
                 if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
                     kwargs["learning_rate"] = self._get_learning_rate()
 
+                # DeepSpeed backward에 scale_wrt_gas를 False로 설정
                 if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                     kwargs["scale_wrt_gas"] = False
                 
@@ -802,28 +916,24 @@ class ValSETrainer(BaseTrainer):
                 total_loss = loss.detach()
 
             else:
-                # For the case 'training mode' with MULTIPLE adapters
+                # Multiple adapters case
                 for adapter_index, adapter_inputs in enumerate(adapter_batches):
-
                     adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
                     
-                    # Set adapter
                     if is_peft_available() and isinstance(model, PeftModel):
                         model.set_adapter(adapter_name)
                     
                     print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
                     
-                    # Forward & Backward
                     with self.compute_loss_context_manager():
-                        # breakpoint()
                         loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
                     if self.args.n_gpu > 1:
                         loss = loss.mean()
                     
-                    # Normalize loss
-                    if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
-                        if self.compute_loss_func is None:
+                    # DeepSpeed handles scaling
+                    if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+                        if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
                             loss = loss / self.current_gradient_accumulation_steps
                     
                     kwargs = {}
@@ -833,9 +943,7 @@ class ValSETrainer(BaseTrainer):
                     if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                         kwargs["scale_wrt_gas"] = False
                     
-                    # Backward
                     self.accelerator.backward(loss, **kwargs)
-                    
                     total_loss += loss.detach()
 
                     if self.accelerator.is_main_process:
@@ -846,26 +954,16 @@ class ValSETrainer(BaseTrainer):
 
                         if adapter_grads:
                             avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
-                            print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Average gradient norm: {avg_grad_norm:.6f} | Total Param count: {len(adapter_grads)} | Min: {min(adapter_grads):.6f} | Max: {max(adapter_grads):.6f}")
+                            print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Avg gradient norm: {avg_grad_norm:.6f}")
                         else:
                             print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
-                        # 여기까지는 출력 나온거 확인함
 
                     del adapter_inputs
+                    
+                    # GPU 메모리 정리
                     if self.args.torch_empty_cache_steps is not None:
-                        if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
-                            if is_torch_xpu_available():
-                                torch.xpu.empty_cache()
-                            elif is_torch_mlu_available():
-                                torch.mlu.empty_cache()
-                            elif is_torch_musa_available():
-                                torch.musa.empty_cache()
-                            elif is_torch_npu_available():
-                                torch.npu.empty_cache()
-                            elif is_torch_mps_available():
-                                torch.mps.empty_cache()
-                            else:
-                                torch.cuda.empty_cache()
+                        if adapter_index < len(adapter_batches) - 1:
+                            torch.cuda.empty_cache()
 
             return total_loss
 
@@ -1169,20 +1267,16 @@ class ValSETrainer(BaseTrainer):
 
     @profiling_decorator
     def _move_model_to_vllm(self, adapter_name: Optional[str] = None):
-        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        
         if zero_stage_3:
             import deepspeed
-
             gather_if_zero3 = deepspeed.zero.GatheredParameters
         else:
             gather_if_zero3 = nullcontext
 
         if is_peft_model(self.model) and self.lora_modules:
-            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
-            # merging adapters in a sharded manner is not supported.
-            # TODO: does this work with FSDP?
             adapters_to_process = [adapter_name] if adapter_name else self.adapter_names
 
             for adapter in adapters_to_process:
@@ -1196,53 +1290,28 @@ class ValSETrainer(BaseTrainer):
 
                 self.model.set_adapter(adapter)
                 adapter_path = adapter_info["path"]
+                
+                # DeepSpeed ZeRO-3의 경우 전체 파라미터를 gather
                 with gather_if_zero3(list(self.model.parameters())):
-                    # self.model.merge_adapter()
-
                     self.model.save_pretrained(
-                        adapter_path, save_adapter=True, save_config=True, safe_serialization=True
+                        adapter_path, 
+                        save_adapter=True, 
+                        save_config=True, 
+                        safe_serialization=True
                     )
-                    print(f"  >> [vLLM Sync] Adapter '{adapter}' merged and saved to '{adapter_path}'.")
+                    print(f"  >> [vLLM Sync] Adapter '{adapter}' saved to '{adapter_path}'.")
+                    
+                    # Synchronize with barrier for DeepSpeed
+                    if zero_stage_3:
+                        torch.distributed.barrier()
 
-                    # # Update vLLM weights while parameters are gathered
-                    # if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    #     # Update vLLM weights while parameters are gathered
-                    #     # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    #     fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                    #     fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                    #     if fsdp_version == 1:
-                    #         self._sync_fsdp1_params_to_vllm(
-                    #             self.model
-                    #         )  # use memory-efficient post-order traversal for FSDP
-                    #     elif fsdp_version == 2:
-                    #         self._sync_fsdp2_params_to_vllm(self.model)
-                    # else:
-                    #     # DeepSpeed ZeRO-3 with PEFT
-                    #     for name, param in self.model.named_parameters():
-                    #         # When using PEFT, we need to recover the original parameter name and discard some parameters
-                    #         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                    #         if self.model.prefix in name:
-                    #             continue
-                    #         # When module to save, remove its prefix and discard the original module
-                    #         if "original_module" in name:
-                    #             continue
-                    #         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-
-                    #         if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                    #             self.vllm_client.update_named_param(name, param.data)
-                    #         elif self.vllm_mode == "colocate":
-                    #             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    #             llm_model.load_weights([(name, param.data)])
-                    # # Unmerge adapters while parameters are still gathered
-                    # self.model.unmerge_adapter()
-                    # Parameters will automatically be repartitioned when exiting the context
         else:
-            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
+            # Non-PEFT models
             if self.is_fsdp_enabled:
                 fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
                 fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
                 if fsdp_version == 1:
-                    self._sync_fsdp1_params_to_vllm(self.model)  # use memory-efficient post-order traversal for FSDP
+                    self._sync_fsdp1_params_to_vllm(self.model)
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(self.model)
             else:
@@ -1255,11 +1324,105 @@ class ValSETrainer(BaseTrainer):
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                             llm_model.load_weights([(name, param.data)])
 
-        # Reset cache on vLLM
+        # Reset cache
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
+            
+    # @profiling_decorator
+    # def _move_model_to_vllm(self, adapter_name: Optional[str] = None):
+    #     # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
+    #     deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+    #     zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+    #     if zero_stage_3:
+    #         import deepspeed
+
+    #         gather_if_zero3 = deepspeed.zero.GatheredParameters
+    #     else:
+    #         gather_if_zero3 = nullcontext
+
+    #     if is_peft_model(self.model) and self.lora_modules:
+    #         # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
+    #         # merging adapters in a sharded manner is not supported.
+    #         # TODO: does this work with FSDP?
+    #         adapters_to_process = [adapter_name] if adapter_name else self.adapter_names
+
+    #         for adapter in adapters_to_process:
+    #             print(f"  >> [vLLM Sync] Syncing Adapter '{adapter}' to vLLM...")
+
+    #             adapter_info = next((module for module in self.lora_modules if module["name"] == adapter), None)
+
+    #             if not adapter_info:
+    #                 print(f"  >> [Warning] Adapter info for '{adapter}' not found in lora_modules.")
+    #                 continue
+
+    #             self.model.set_adapter(adapter)
+    #             adapter_path = adapter_info["path"]
+    #             with gather_if_zero3(list(self.model.parameters())):
+    #                 # self.model.merge_adapter()
+
+    #                 self.model.save_pretrained(
+    #                     adapter_path, save_adapter=True, save_config=True, safe_serialization=True
+    #                 )
+    #                 print(f"  >> [vLLM Sync] Adapter '{adapter}' merged and saved to '{adapter_path}'.")
+
+    #                 # # Update vLLM weights while parameters are gathered
+    #                 # if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
+    #                 #     # Update vLLM weights while parameters are gathered
+    #                 #     # For PEFT with FSDP we need to use the memory efficient post-order traversal
+    #                 #     fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+    #                 #     fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+    #                 #     if fsdp_version == 1:
+    #                 #         self._sync_fsdp1_params_to_vllm(
+    #                 #             self.model
+    #                 #         )  # use memory-efficient post-order traversal for FSDP
+    #                 #     elif fsdp_version == 2:
+    #                 #         self._sync_fsdp2_params_to_vllm(self.model)
+    #                 # else:
+    #                 #     # DeepSpeed ZeRO-3 with PEFT
+    #                 #     for name, param in self.model.named_parameters():
+    #                 #         # When using PEFT, we need to recover the original parameter name and discard some parameters
+    #                 #         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+    #                 #         if self.model.prefix in name:
+    #                 #             continue
+    #                 #         # When module to save, remove its prefix and discard the original module
+    #                 #         if "original_module" in name:
+    #                 #             continue
+    #                 #         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+
+    #                 #         if self.vllm_mode == "server" and self.accelerator.is_main_process:
+    #                 #             self.vllm_client.update_named_param(name, param.data)
+    #                 #         elif self.vllm_mode == "colocate":
+    #                 #             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+    #                 #             llm_model.load_weights([(name, param.data)])
+    #                 # # Unmerge adapters while parameters are still gathered
+    #                 # self.model.unmerge_adapter()
+    #                 # Parameters will automatically be repartitioned when exiting the context
+    #     else:
+    #         # For non-PEFT models, simply gather (if needed) and update each parameter individually.
+    #         if self.is_fsdp_enabled:
+    #             fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+    #             fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+    #             if fsdp_version == 1:
+    #                 self._sync_fsdp1_params_to_vllm(self.model)  # use memory-efficient post-order traversal for FSDP
+    #             elif fsdp_version == 2:
+    #                 self._sync_fsdp2_params_to_vllm(self.model)
+    #         else:
+    #             for name, param in self.model.named_parameters():
+    #                 name = self._fix_param_name_to_vllm(name)
+    #                 with gather_if_zero3([param]):
+    #                     if self.vllm_mode == "server" and self.accelerator.is_main_process:
+    #                         self.vllm_client.update_named_param(name, param.data)
+    #                     elif self.vllm_mode == "colocate":
+    #                         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+    #                         llm_model.load_weights([(name, param.data)])
+
+    #     # Reset cache on vLLM
+    #     if self.vllm_mode == "server" and self.accelerator.is_main_process:
+    #         self.vllm_client.reset_prefix_cache()
+    #     elif self.vllm_mode == "colocate":
+    #         self.llm.reset_prefix_cache()
 
     @profiling_decorator
     def _prepare_inputs(
