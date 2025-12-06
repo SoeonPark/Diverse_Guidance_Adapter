@@ -709,6 +709,7 @@ class ValSETrainer(BaseTrainer):
 
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
+                print("  >> Preparing reference model with DeepSpeed...")
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             elif self.is_fsdp_enabled:
                 self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
@@ -814,9 +815,41 @@ class ValSETrainer(BaseTrainer):
                     print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
                     
                     # Forward & Backward
-                    with self.compute_loss_context_manager():
-                        # breakpoint()
-                        loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+                    if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+                        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+                        
+                        if zero_stage_3:
+                            import deepspeed
+                            
+                            adapter_params = [
+                                p for n, p in model.named_parameters() 
+                                if adapter_name in n or "lora" in n.lower()
+                            ]
+                            
+                            with deepspeed.zero.GatheredParameters(adapter_params, modifier_rank=0):
+                                if is_peft_available() and isinstance(model, PeftModel):
+                                    model.set_adapter(adapter_name)
+                                
+                                # Forward & Backward
+                                with self.compute_loss_context_manager():
+                                    loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+                        else:
+                            if is_peft_available() and isinstance(model, PeftModel):
+                                model.set_adapter(adapter_name)
+                            
+                            with self.compute_loss_context_manager():
+                                loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+                    else:
+                        if is_peft_available() and isinstance(model, PeftModel):
+                            model.set_adapter(adapter_name)
+                        
+                        with self.compute_loss_context_manager():
+                            loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
+
+                    # with self.compute_loss_context_manager():
+                    #     # breakpoint()
+                    #     loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
                     if self.args.n_gpu > 1:
                         loss = loss.mean()
@@ -887,6 +920,7 @@ class ValSETrainer(BaseTrainer):
     # Maintenance note: This method is a copy-paste of the original `Trainer.get_train_dataloader` with only one line
     # modification. As a result, some parts of the method aren't relevant to GRPO, but we keep them to stay one line
     # apart from the super method, ensuring easier maintenance in the future.
+    
     def get_train_dataloader(self):
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -898,8 +932,12 @@ class ValSETrainer(BaseTrainer):
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
+        if self.accelerator.num_processes > 1:
+            per_device_batch_size = (self._train_batch_size * self.args.steps_per_generation) // self.accelerator.num_processes
+        else:
+            per_device_batch_size = self._train_batch_size * self.args.steps_per_generation
         dataloader_params = {
-            "batch_size": self._train_batch_size * self.args.steps_per_generation,  # < this is the change
+            "batch_size": per_device_batch_size,  # < this is the change
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -915,6 +953,7 @@ class ValSETrainer(BaseTrainer):
 
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
+        # breakpoint()
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
 
@@ -1285,6 +1324,7 @@ class ValSETrainer(BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations # 1
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 original_inputs = generation_batch
+                # breakpoint()
 
                 print(f"  >> Original Inputs: {original_inputs}")
                 print(f">>> [Generation Step] Generating completions for step {self._step}/{generate_every}...")
@@ -1589,6 +1629,16 @@ class ValSETrainer(BaseTrainer):
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
 
+                    if len(output_reward_func) != len(prompts):
+                        raise ValueError(
+                            f"Reward function '{reward_func_name}' returned {len(output_reward_func)} rewards, "
+                            f"but expected {len(prompts)} rewards."
+                        )
+                        if len(output_reward_func) > len(prompts):
+                            output_reward_func = output_reward_func[: len(prompts)]
+                        else:
+                            output_reward_func.extend([torch.nan] * (len(prompts) - len(output_reward_func)))
+
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         
         # If all reward functions return None for a given row, issue a detailed warning
@@ -1607,7 +1657,7 @@ class ValSETrainer(BaseTrainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        # rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
     @profiling_decorator
@@ -1748,7 +1798,7 @@ class ValSETrainer(BaseTrainer):
             )
 
         # Gather across processes
-        rewards_per_func = gather(rewards_per_func)
+        # rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
     def _generate_single_turn(self, prompts: list, adapter_name: Optional[str] = None):
@@ -2374,12 +2424,17 @@ class ValSETrainer(BaseTrainer):
 
         # Calculate Correctness Rewards Once for ALL!!!!
         print(f"  >> [Scoring] Scoring Correctness for a Total of {total_completions} Completions from Each Adapter")
+        # breakpoint()
         all_correctness_rewards = self._calculate_rewards_correctness(
             inputs, prompts, completions, completion_ids_list
         ).to(device)
         # Shape: (num_generations, num_correctness_reward_funcs) e.g., (3, 1)
         # breakpoint()
 
+        if self.accelerator.num_processes > 1:
+            all_correctness_rewards = gather(all_correctness_rewards, dim=0)
+            print(f"  >> [Scoring] Gathered correctness rewards from all processes. New shape: {all_correctness_rewards.shape}")
+        
         all_rewards_per_func = []
         all_advantages = []
 
@@ -2458,6 +2513,10 @@ class ValSETrainer(BaseTrainer):
                 ).to(device)
                 # Shape: (num_generations, num_diversity_reward_funcs) e.g., (3, 2)
                 # breakpoint()
+
+                if self.accelerator.num_processes > 1:
+                    diversity_rewards = gather(diversity_rewards, dim=0)
+                    print(f"  >> [Scoring] Gathered diversity rewards from all processes. New shape: {diversity_rewards.shape}")
                 
                 if self.args.masking_diversity_by_correctness is True:
                     correctness_mask = (all_correctness_rewards[start_index:end_index] > 0.0).float() # (N, 1)
@@ -3160,4 +3219,5 @@ class ValSETrainer(BaseTrainer):
         self.create_model_card(model_name=model_name)
 
         super()._save_checkpoint(model, trial)
+        p
 
