@@ -1448,7 +1448,7 @@ class ValSETrainer(BaseTrainer):
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations # 1
             if self._step % generate_every == 0 or self._buffered_inputs is None:
-                original_inputs = generation_batch
+                original_inputs = generation_batch 
 
                 print(f"  >> Original Inputs: {original_inputs}")
                 print(f">>> [Generation Step] Generating completions for step {self._step}/{generate_every}...")
@@ -1747,13 +1747,15 @@ class ValSETrainer(BaseTrainer):
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                     # breakpoint()
                 else:
+                    # breakpoint()
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
+                    # breakpoint()
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                # breakpoint()
         
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1771,7 +1773,7 @@ class ValSETrainer(BaseTrainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        # rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
     @profiling_decorator
@@ -1912,7 +1914,7 @@ class ValSETrainer(BaseTrainer):
             )
 
         # Gather across processes
-        rewards_per_func = gather(rewards_per_func)
+        # rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
     def _generate_single_turn(self, prompts: list, adapter_name: Optional[str] = None):
