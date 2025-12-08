@@ -491,6 +491,7 @@ class ValSETrainer(BaseTrainer):
         else:
             # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
             config = AutoConfig.from_pretrained(model_id)
+            print("  >> [GRPO Init] Loading reference model from pretrained weights for Deepspeed mode...")
             architecture = getattr(transformers, config.architectures[0])
             self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
 
