@@ -53,7 +53,7 @@ from trl.models.utils import _ForwardRedirection
 from trl.trainer.base_trainer import BaseTrainer
 from trl.trainer.callbacks import SyncRefModelCallback
 from trl import GRPOConfig, GRPOTrainer
-from custom_dgrpo_config import DGRPOConfig
+from custom_valse_config import ValSEConfig
 from trl.trainer.utils import (
     RepeatSampler,
     disable_dropout_in_model,
@@ -97,6 +97,9 @@ from pathlib import Path
 import json
 from time import time
 
+from vllm.sampling_params import SamplingParams
+from vllm.lora.request import LoRARequest
+
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches
     from accelerate import __version__ as accelerate_version
@@ -115,7 +118,7 @@ if is_peft_available():
     from peft import PeftConfig, PeftModel
 
 if is_liger_kernel_available():
-    from liger_kernel.chunked_loss import LigerFusedLinearDGRPOLoss
+    from liger_kernel.chunked_loss import LigerFusedLinearValSELoss
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
@@ -146,7 +149,7 @@ logging.get_logger("vllm").setLevel(logging.WARNING)
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 
-# What we call a rollout function is a callable that takes prompts (list), args (DGRPOConfig), and processing_class as
+# What we call a rollout function is a callable that takes prompts (list), args (ValSEConfig), and processing_class as
 # parameters and returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and
 # "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
 RolloutFunc = Callable[[list[str], Any, Any], dict[str, Any]]
@@ -208,7 +211,7 @@ class ValSETrainer(BaseTrainer):
         reward_funcs_correctness: Union[RewardFunc, list[RewardFunc]], # NEW
         reward_funcs_diversity: Union[RewardFunc, list[RewardFunc]], # NEW
         adapter_name: Optional[str] = None, # NEW
-        args: Optional[DGRPOConfig] = None,
+        args: Optional[ValSEConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[Union[PreTrainedTokenizerBase, ProcessorMixin]] = None,
@@ -223,7 +226,7 @@ class ValSETrainer(BaseTrainer):
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
-            args = DGRPOConfig(f"{model_name}-GRPO")
+            args = ValSEConfig(f"{model_name}-GRPO")
 
         # Models
         # Trained model
@@ -728,9 +731,6 @@ class ValSETrainer(BaseTrainer):
                     self.reward_funcs_correctness[i] = self.accelerator.prepare_model(
                         reward_func, evaluation_mode=True, device_placement=True
                     )
-    
-    # [Not originally in GRPO] In transformers.Trainer:
-    # Not Modified yet
 
     # def training_step(
     #     self,
@@ -738,36 +738,13 @@ class ValSETrainer(BaseTrainer):
     #     inputs: dict[str, Union[torch.Tensor, Any]],
     #     num_items_in_batch: Optional[torch.Tensor] = None,
     # ) -> torch.Tensor:
-    
-    #     """
-    #     Perform a training step on a batch of inputs.
-
-    #     Subclass and override to inject custom behavior.
-
-    #     Args:
-    #         model (`nn.Module`):
-    #             The model to train.
-    #         inputs (`dict[str, Union[torch.Tensor, Any]]`):
-    #             The inputs and targets of the model.
-
-    #             The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-    #             argument `labels`. Check your model's documentation for all accepted arguments.
-
-    #     Return:
-    #         `torch.Tensor`: The tensor with training loss on this batch.
-    #     """
-    #     # Prepare buffers for context parallelism
-    #     # breakpoint()
-
+        
     #     cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
 
-    #     # Context manager is no-op if CP isn't enabled
     #     with cp_context():
     #         model.train()
     #         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
     #             self.optimizer.train()
-
-    #         # breakpoint()
 
     #         inputs = self._prepare_inputs(inputs)
 
@@ -775,27 +752,26 @@ class ValSETrainer(BaseTrainer):
     #             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
     #             return loss_mb.reduce_mean().detach().to(self.args.device)
 
-    #         # adapter_names = inputs["adapter_info"]["adapter_names"]
-    #         # num_generations_per_adapter = inputs["adapter_info"]["num_generations_per_adapter"]
-
     #         total_loss = 0.0
-
     #         adapter_batches = inputs.get("adapter_batches")
 
-    #         # For the case 'inference mode' oronly use one adapter
     #         if adapter_batches is None:
     #             with self.compute_loss_context_manager():
-    #                 loss = self.compute_loss(model, inputs, num_items_in_batch = num_items_in_batch)
+    #                 loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                
     #             if self.args.n_gpu > 1:
-    #                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
+    #                 loss = loss.mean()
 
-    #             if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
-    #                 loss = loss / self.current_gradient_accumulation_steps
+    #             # DeepSpeed handles scaling internally, so check before manual scaling
+    #             if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+    #                 if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+    #                     loss = loss / self.current_gradient_accumulation_steps
 
     #             kwargs = {}
     #             if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
     #                 kwargs["learning_rate"] = self._get_learning_rate()
 
+    #             # DeepSpeed backward에 scale_wrt_gas를 False로 설정
     #             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
     #                 kwargs["scale_wrt_gas"] = False
                 
@@ -803,28 +779,24 @@ class ValSETrainer(BaseTrainer):
     #             total_loss = loss.detach()
 
     #         else:
-    #             # For the case 'training mode' with MULTIPLE adapters
+    #             # Multiple adapters case
     #             for adapter_index, adapter_inputs in enumerate(adapter_batches):
-
     #                 adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
                     
-    #                 # Set adapter
     #                 if is_peft_available() and isinstance(model, PeftModel):
     #                     model.set_adapter(adapter_name)
                     
     #                 print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
                     
-    #                 # Forward & Backward
     #                 with self.compute_loss_context_manager():
-    #                     # breakpoint()
     #                     loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
     #                 if self.args.n_gpu > 1:
     #                     loss = loss.mean()
                     
-    #                 # Normalize loss
-    #                 if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
-    #                     if self.compute_loss_func is None:
+    #                 # DeepSpeed handles scaling
+    #                 if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+    #                     if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
     #                         loss = loss / self.current_gradient_accumulation_steps
                     
     #                 kwargs = {}
@@ -834,9 +806,7 @@ class ValSETrainer(BaseTrainer):
     #                 if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
     #                     kwargs["scale_wrt_gas"] = False
                     
-    #                 # Backward
     #                 self.accelerator.backward(loss, **kwargs)
-                    
     #                 total_loss += loss.detach()
 
     #                 if self.accelerator.is_main_process:
@@ -847,26 +817,16 @@ class ValSETrainer(BaseTrainer):
 
     #                     if adapter_grads:
     #                         avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
-    #                         print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Average gradient norm: {avg_grad_norm:.6f} | Total Param count: {len(adapter_grads)} | Min: {min(adapter_grads):.6f} | Max: {max(adapter_grads):.6f}")
+    #                         print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Avg gradient norm: {avg_grad_norm:.6f}")
     #                     else:
     #                         print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
-    #                     # 여기까지는 출력 나온거 확인함
 
     #                 del adapter_inputs
+                    
+    #                 # GPU 메모리 정리
     #                 if self.args.torch_empty_cache_steps is not None:
-    #                     if adapter_index < len(adapter_batches) - 1: # avoid redundant empty_cache at the end of last adapter
-    #                         if is_torch_xpu_available():
-    #                             torch.xpu.empty_cache()
-    #                         elif is_torch_mlu_available():
-    #                             torch.mlu.empty_cache()
-    #                         elif is_torch_musa_available():
-    #                             torch.musa.empty_cache()
-    #                         elif is_torch_npu_available():
-    #                             torch.npu.empty_cache()
-    #                         elif is_torch_mps_available():
-    #                             torch.mps.empty_cache()
-    #                         else:
-    #                             torch.cuda.empty_cache()
+    #                     if adapter_index < len(adapter_batches) - 1:
+    #                         torch.cuda.empty_cache()
 
     #         return total_loss
 
@@ -890,17 +850,16 @@ class ValSETrainer(BaseTrainer):
                 loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
                 return loss_mb.reduce_mean().detach().to(self.args.device)
 
-            total_loss = 0.0
             adapter_batches = inputs.get("adapter_batches")
 
             if adapter_batches is None:
+                # Single adapter case - 기존과 동일
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                 
                 if self.args.n_gpu > 1:
                     loss = loss.mean()
 
-                # DeepSpeed handles scaling internally, so check before manual scaling
                 if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
                     if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
                         loss = loss / self.current_gradient_accumulation_steps
@@ -909,34 +868,41 @@ class ValSETrainer(BaseTrainer):
                 if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
                     kwargs["learning_rate"] = self._get_learning_rate()
 
-                # DeepSpeed backward에 scale_wrt_gas를 False로 설정
                 if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                     kwargs["scale_wrt_gas"] = False
                 
                 self.accelerator.backward(loss, **kwargs)
-                total_loss = loss.detach()
+                return loss.detach()
 
             else:
-                # Multiple adapters case
+                # Multiple adapters - 각 adapter별로 독립적으로 처리
+                total_loss = torch.tensor(0.0, device=self.accelerator.device)
+                num_adapters = len(adapter_batches)
+                
                 for adapter_index, adapter_inputs in enumerate(adapter_batches):
                     adapter_name = adapter_inputs["adapter_info"]["adapter_names"][0]
+                    is_last_adapter = (adapter_index == num_adapters - 1)
                     
                     if is_peft_available() and isinstance(model, PeftModel):
                         model.set_adapter(adapter_name)
                     
-                    print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{len(adapter_batches)})")
+                    print(f"  >> [Training Step] Processing adapter '{adapter_name}' ({adapter_index + 1}/{num_adapters})")
                     
+                    # Forward
                     with self.compute_loss_context_manager():
                         loss = self.compute_loss(model, adapter_inputs, num_items_in_batch=num_items_in_batch)
                     
                     if self.args.n_gpu > 1:
                         loss = loss.mean()
                     
-                    # DeepSpeed handles scaling
+                    # Loss scaling
+                    loss = loss / (1+self.args.num_specialist_adapters)  # adapter 개수로 나눔
+                    
                     if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
                         if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
                             loss = loss / self.current_gradient_accumulation_steps
-                    
+
+                    # Backward with gradient accumulation (no_sync for all but last)
                     kwargs = {}
                     if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
                         kwargs["learning_rate"] = self._get_learning_rate()
@@ -944,30 +910,32 @@ class ValSETrainer(BaseTrainer):
                     if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                         kwargs["scale_wrt_gas"] = False
                     
-                    self.accelerator.backward(loss, **kwargs)
-                    total_loss += loss.detach()
-
-                    if self.accelerator.is_main_process:
-                        adapter_grads = []
-                        for name, param in model.named_parameters():
-                            if param.grad is not None:
-                                adapter_grads.append(param.grad.norm().item())
-
-                        if adapter_grads:
-                            avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
-                            print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f} | Avg gradient norm: {avg_grad_norm:.6f}")
-                        else:
-                            print(f"    >> [Adapter '{adapter_name}'] No gradients found.")
-
-                    del adapter_inputs
+                    # DeepSpeed에서는 no_sync context 사용
+                    if is_last_adapter:
+                        # 마지막 adapter: gradient sync 수행
+                        self.accelerator.backward(loss, **kwargs)
+                    else:
+                        # 중간 adapter: gradient sync 하지 않음
+                        with self.accelerator.no_sync(model):
+                            self.accelerator.backward(loss, **kwargs)
                     
-                    # GPU 메모리 정리
-                    if self.args.torch_empty_cache_steps is not None:
-                        if adapter_index < len(adapter_batches) - 1:
-                            torch.cuda.empty_cache()
+                    total_loss = total_loss + loss.detach()
+                    
+                    print(f"    >> [Adapter '{adapter_name}'] Loss: {loss.item():.4f}")
 
-            return total_loss
+                # Gradient logging
+                if self.accelerator.is_main_process:
+                    adapter_grads = []
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            adapter_grads.append(param.grad.norm().item())
 
+                    if adapter_grads:
+                        avg_grad_norm = sum(adapter_grads) / len(adapter_grads)
+                        print(f"    >> [Combined] Avg gradient norm: {avg_grad_norm:.6f}")
+
+                return total_loss
+            
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -998,7 +966,7 @@ class ValSETrainer(BaseTrainer):
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
         dataloader_params = {
-            "batch_size": self._train_batch_size * self.args.steps_per_generation,  # < this is the change
+            "batch_size": self.args.num_generations * self.args.steps_per_generation,  # < this is the change
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -1161,6 +1129,7 @@ class ValSETrainer(BaseTrainer):
         token_type_ids=None,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
+
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
@@ -1448,13 +1417,13 @@ class ValSETrainer(BaseTrainer):
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations # 1
             if self._step % generate_every == 0 or self._buffered_inputs is None:
-                original_inputs = generation_batch 
+                original_inputs = generation_batch # -> 20
 
                 print(f"  >> Original Inputs: {original_inputs}")
                 print(f">>> [Generation Step] Generating completions for step {self._step}/{generate_every}...")
                 print(self.args.steps_per_generation)
                 # breakpoint()
-                generation_batch = self._generate_completions(generation_batch)
+                generation_batch = self._generate_completions(generation_batch) 
                 # breakpoint()
                 scored_outputs = self._score_completions(original_inputs, generation_batch)
 
@@ -1515,7 +1484,8 @@ class ValSETrainer(BaseTrainer):
                             # advantages are already repeated per generation
                             adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
                         elif key == "old_per_token_logps":
-                            adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
+                            if value is not None:
+                                adapter_data[key] = value[adv_index: adv_index + (end_index - start_index)].detach()
                         elif key == "num_items_in_batch":
                             pass
                         elif key == "all_extra_fields":
@@ -1783,6 +1753,7 @@ class ValSETrainer(BaseTrainer):
         completions: list[str],
         completion_ids_list: list[torch.Tensor],
         other_adapter_data: Optional[dict] = None,
+        exclude_self: bool = False,
     ) -> torch.Tensor:
         """Calculate diversity rewards for the generated completions."""
         device = self.accelerator.device
@@ -1810,14 +1781,24 @@ class ValSETrainer(BaseTrainer):
         ):
             print(f"  >> Using `reward_func_diversity`: {reward_func_name}")
             
-            all_diversity_scores = []  # 각 completion마다 1개 diversity score
+            all_diversity_scores = []  
             
             for curr_index, (curr_prompt, curr_completion) in enumerate(zip(prompts, completions)):
-                # Module-based reward function
+                if exclude_self:
+                    filtered_indices = [j for j in range(len(other_completions_text)) if j != curr_index]
+                else:
+                    filtered_indices = list(range(len(other_completions_text)))
+
+                if len(filtered_indices) == 0:
+                    all_diversity_scores.append(float("nan"))
+                    continue
+
+                filtered_completions = [other_completions_text[j] for j in filtered_indices]
+
                 if isinstance(reward_func, nn.Module):
                     similarities = []
                     
-                    for other_completion in other_completions_text:
+                    for other_completion in filtered_completions:
                         if is_conversational(inputs[0]):
                             messages = {"messages": curr_prompt + curr_completion + other_completion}
                             texts = [
@@ -1842,7 +1823,7 @@ class ValSETrainer(BaseTrainer):
                     
                     # Mean similarity
                     mean_similarity = sum(similarities) / len(similarities) if similarities else 0.0
-                    diversity_score = -mean_similarity  # Lower similarity = higher diversity
+                    diversity_score = mean_similarity  # Lower similarity = higher diversity
                     all_diversity_scores.append(diversity_score)
 
                 # Non-module reward function
@@ -1850,10 +1831,10 @@ class ValSETrainer(BaseTrainer):
                     print(f"  >> Compare using non-module diversity reward function: {reward_func_name}")
                     
                     # Convert format if needed
-                    other_completions_formatted = other_completions_text
-                    if other_completions_text and isinstance(other_completions_text[0], str):
+                    other_completions_formatted = filtered_completions
+                    if filtered_completions and isinstance(filtered_completions[0], str):
                         other_completions_formatted = [
-                            [{"role": "assistant", "content": text}] for text in other_completions_text
+                            [{"role": "assistant", "content": text}] for text in filtered_completions
                         ]
 
                     reward_kwargs["other_completions"] = other_completions_formatted
@@ -1974,6 +1955,7 @@ class ValSETrainer(BaseTrainer):
                                 ordered_set_of_prompts,
                                 self.args,
                                 self.processing_class,
+                                lora_request=all_lora_request,
                             )
                         else:
                             if is_conversational({"prompt": ordered_set_of_prompts[0]}):
@@ -2233,6 +2215,7 @@ class ValSETrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, total_completion_tokens, logprobs, extra_fields
 
+
     # Split Generation step and Scoring step for easier overriding in subclasses
     def _generate_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
@@ -2254,7 +2237,6 @@ class ValSETrainer(BaseTrainer):
         total_num_items = 0
 
         adapter_boundaries = []
-        current_adapter = 0
 
         prompts = [x["prompt"] for x in inputs]
         """
@@ -2263,48 +2245,137 @@ class ValSETrainer(BaseTrainer):
         """
         # breakpoint()
 
+        if self.use_vllm and self.vllm_mode == "colocate":
+            all_prompts = []
+            all_lora_requests = []
+
+            idx = 0
+            for adapter_name, num_gen in zip(self.adapter_names, self.num_generations_per_adapter):
+                adapter_info = next(m for m in self.lora_modules if m["name"] == adapter_name)
+                lora_req = LoRARequest(
+                    lora_name = adapter_info["name"],
+                    lora_int_id = adapter_info["id"],
+                    lora_local_path= adapter_info["path"],
+                )
+
+                start_idx = idx
+                for _ in range(num_gen):
+                    all_prompts.append(prompts[idx])
+                    all_lora_requests.append(lora_req)
+                    idx += 1
+                end_idx = idx
+
+                adapter_boundaries.append((start_idx, end_idx))
+
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()  
+                self._last_loaded_step = self.state.global_step
+
+            generation_kwargs = {
+                "n": 1, 
+                "repetition_penalty": self.repetition_penalty,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": -1 if self.top_k is None else self.top_k,
+                "min_p": 0.0 if self.min_p is None else self.min_p,
+                "max_tokens": self.max_completion_length,
+                "truncate_prompt_tokens": self.max_prompt_length,
+                "logprobs": 0,  
+            }
+            if self.args.generation_kwargs is not None:
+                generation_kwargs.update(self.args.generation_kwargs)
+            sampling_params = SamplingParams(**generation_kwargs)
+
+            if self.args.vllm_enable_sleep_mode:
+                self.llm.wake_up(tags=["kv_cache"])
+
+            with profiling_context(self, "vLLM.generate_multi_lora"):
+                if is_conversational({"prompt": all_prompts[0]}):
+                    tokenizer = self.llm.get_tokenizer()
+                    formatted_prompts = [
+                        tokenizer.apply_chat_template(
+                            prompt, 
+                            tokenize=False, 
+                            add_generation_prompt=True
+                        )
+                        for prompt in all_prompts
+                    ]
+                    all_outputs = self.llm.generate(
+                        formatted_prompts,
+                        sampling_params=sampling_params,
+                        use_tqdm=False,
+                        lora_request=all_lora_requests,
+                    )
+                else:
+                    all_outputs = self.llm.generate(
+                        all_prompts,
+                        sampling_params=sampling_params,
+                        use_tqdm=False,
+                        lora_request=all_lora_requests,
+                    )
+
+            all_prompt_ids_list = [output.prompt_token_ids for output in all_outputs]
+            all_completion_ids_list = [
+                output.token_ids for outputs in all_outputs for output in outputs.outputs
+            ]
+            all_sampling_per_token_logps_list = [
+                [next(iter(lp.values())).logprob for lp in output.logprobs]
+                for outputs in all_outputs
+                for output in outputs.outputs
+            ]
+
+            all_extra_fields_list = [{} for _ in all_outputs]
+
+            total_num_items = sum(len(ids) for ids in all_completion_ids_list)
+
+            if self.args.vllm_enable_sleep_mode:
+                self.llm.sleep(level=2)
+
         # Generate completions by adapters
-        for adapter_index, (adapter_name, num_generation) in enumerate(zip(self.adapter_names, self.num_generations_per_adapter)):
-            if is_peft_available() and isinstance(self.model, PeftModel):
-                self.model.set_adapter(adapter_name)
-                if self.use_vllm and self.vllm_mode == "colocate":
-                    self._move_model_to_vllm()  # update vLLM weights for the new adapter
-                    self._last_loaded_step = self.state.global_step
+        else:
+            current_adapter = 0
+            for adapter_index, (adapter_name, num_generation) in enumerate(zip(self.adapter_names, self.num_generations_per_adapter)):
+                if is_peft_available() and isinstance(self.model, PeftModel):
+                    self.model.set_adapter(adapter_name)
+                    if self.use_vllm and self.vllm_mode == "colocate":
+                        self._move_model_to_vllm()  # update vLLM weights for the new adapter
+                        self._last_loaded_step = self.state.global_step
 
-            print(f"  >> [Rollout] Generating {num_generation} completions using adapter '{adapter_name}'")
-            
-            # Repeat each prompt 'num_generations' times for the current adapter
-            # batch_size = len(inputs)
+                print(f"  >> [Rollout] Generating {num_generation} completions using adapter '{adapter_name}'")
+                
+                # Repeat each prompt 'num_generations' times for the current adapter
+                # batch_size = len(inputs)
 
-            # breakpoint()
-            """
-            (Pdb) len(completion_ids_list[0])
-            412
-            (Pdb) num_items_in_batch
-            tensor(412, device='cuda:0')
-            """
-            start_index = current_adapter
-            end_index = current_adapter + num_generation
-            
-            prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-                self._generate(prompts[start_index:end_index], adapter_name=adapter_name) 
-            )
+                # breakpoint()
+                """
+                (Pdb) len(completion_ids_list[0])
+                412
+                (Pdb) num_items_in_batch
+                tensor(412, device='cuda:0')
+                """
+                start_index = current_adapter
+                end_index = current_adapter + num_generation
+                
+                prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
+                    self._generate(prompts[start_index:end_index], adapter_name=adapter_name) 
+                )
 
-            if adapter_name == "default":
-                adapter_boundaries.append((start_index, sum(self.num_generations_per_adapter)))
-            else:
-                adapter_boundaries.append((start_index, end_index))
-            current_adapter = end_index
-            # breakpoint()
+                if adapter_name == "default":
+                    adapter_boundaries.append((start_index, sum(self.num_generations_per_adapter)))
+                else:
+                    adapter_boundaries.append((start_index, end_index))
+                current_adapter = end_index
+                # breakpoint()
 
-            all_prompt_ids_list.extend(prompt_ids_list)
-            all_completion_ids_list.extend(completion_ids_list)
-            if sampling_per_token_logps_list is not None:
-                all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
-            all_extra_fields_list.append(extra_fields)
-            total_num_items += num_items_in_batch
-            # breakpoint()
-            print(f"  >> [Rollout] Generated a total of {total_num_items} completion tokens. | Adapter boundaries: {adapter_boundaries} | Adapter names: {adapter_name}")
+                all_prompt_ids_list.extend(prompt_ids_list)
+                all_completion_ids_list.extend(completion_ids_list)
+                if sampling_per_token_logps_list is not None:
+                    all_sampling_per_token_logps_list.extend(sampling_per_token_logps_list)
+                all_extra_fields_list.append(extra_fields)
+                total_num_items += num_items_in_batch
+                # breakpoint()
+                print(f"  >> [Rollout] Generated a total of {total_num_items} completion tokens. | Adapter boundaries: {adapter_boundaries} | Adapter names: {adapter_name}")
+
 
         if self.use_vllm and self.vllm_mode == "colocate":
             if self.args.vllm_enable_sleep_mode:
@@ -2354,19 +2425,20 @@ class ValSETrainer(BaseTrainer):
 
         num_images = None
         forward_kwargs = {}
-
+        # breakpoint()
         # If token_type_ids are used, extend them with zeros for the completion part
         if "token_type_ids" in forward_kwargs:
             token_type_ids = forward_kwargs["token_type_ids"]
             forward_kwargs["token_type_ids"] = torch.cat(
                 [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
             )
-
+        # breakpoint()
         with torch.no_grad():
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):  
+                # breakpoint()
                 all_old_per_token_logps = []
                 for adapter_name, (start_index, end_index) in zip(self.adapter_names, adapter_boundaries):
                     self.model.set_adapter(adapter_name)
@@ -2551,10 +2623,11 @@ class ValSETrainer(BaseTrainer):
 
         for adapter_index, (adapter_name, num_generations, (start_index, end_index)) in enumerate(zip(adapter_names, num_generations_list, adapter_boundaries)):
             # breakpoint()            
-            print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
 
             if adapter_name == "default":
                 # breakpoint()
+                print(f"   >> [Scoring] Scoring Correctness for Completions from Adapter '{adapter_name}' -- {num_generations} generations({start_index}:{end_index})")
+
                 rewards_per_func = all_correctness_rewards[start_index:end_index]
                 # rewards = (rewards_per_func.to(device).unsqueeze(0)).nansum(dim=1)  # (N,)
                 reward_func_names = self.reward_func_names_correctness
@@ -2595,6 +2668,38 @@ class ValSETrainer(BaseTrainer):
                 if self.scale_rewards != "none":
                     # A_{Main}
                     advantages = advantages / (std_grouped_rewards + 1e-4)
+
+                # if len(self.reward_funcs_diversity) > 0:
+                #     print(f"   >> [Logging] Calculating Diversity for '{adapter_name}' (No Advantage Update)")
+                
+                #     self_adapter_data = {
+                #         "prompt_ids": prompt_ids[start_index:end_index],
+                #         "completion_ids": completion_ids[start_index:end_index],
+                #         "completion_mask": completion_mask[start_index:end_index],
+                #         "sampling_per_token_logps": None 
+                #     }
+                    
+                #     curr_prompts = prompts[start_index:end_index]
+                #     curr_completions = [completions[i] for i in range(start_index, end_index)]
+                #     curr_completion_ids_list = [completion_ids_list[i] for i in range(start_index, end_index)]
+
+                #     diversity_rewards = self._calculate_rewards_diversity(
+                #         inputs, 
+                #         curr_prompts, 
+                #         curr_completions, 
+                #         curr_completion_ids_list,
+                #         other_adapter_data=self_adapter_data,
+                #         exclude_self=True
+                #     ).to(device)
+
+                #     # 다양성 메트릭 로깅
+                #     for i, reward_func_name in enumerate(self.reward_func_names_diversity):
+                #         mean_div = torch.nanmean(diversity_rewards[:, i]).item()
+                #         std_div = nanstd(diversity_rewards[:, i]).item()
+                #         self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/mean"].append(mean_div)
+                #         self._metrics[mode][f"rewards/{adapter_name}/{reward_func_name}/std"].append(std_div)
+                
+                # rewards_per_func = torch.cat([rewards_per_func, diversity_rewards], dim=1)
 
                 self._metrics[mode][f"reward/{adapter_name}"].append(rewards.mean().item())
                 self._metrics[mode][f"reward_std/{adapter_name}"].append(std_grouped_rewards.mean().item())
@@ -2726,17 +2831,15 @@ class ValSETrainer(BaseTrainer):
             adapter_prompts = prompts_text[start_index:end_index]
             adapter_completions = completions_text[start_index:end_index]
             
-            # ===== 핵심 수정 =====
             num_items = num_generations_list[adapter_index]
             adapter_advantages = all_advantages[adv_index:adv_index + num_items]
             adv_index += num_items
-            # ===== 수정 끝 =====
 
             self._logs["prompt"][adapter_name].extend(gather_object(adapter_prompts))
             self._logs["completion"][adapter_name].extend(gather_object(adapter_completions))
 
             if adapter_name == "default":
-                func_names = self.reward_func_names_correctness
+                func_names = self.reward_func_names_correctness 
             else:
                 func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
 
@@ -2758,49 +2861,6 @@ class ValSETrainer(BaseTrainer):
                 gathered_rewards = gather_object(reward_column)
                 self._logs["rewards"][log_key].extend(gathered_rewards)
                 
-        # for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
-        #     zip(adapter_names, adapter_boundaries)
-        # ):
-        #     # Log prompt and completion texts per adapter
-        #     adapter_prompts = prompts_text[start_index:end_index]
-        #     adapter_completions = completions_text[start_index:end_index]
-        #     adapter_advantages = all_advantages[start_index:end_index]
-
-        #     self._logs["prompt"][adapter_name].extend(gather_object(adapter_prompts))
-        #     self._logs["completion"][adapter_name].extend(gather_object(adapter_completions))
-
-        #     # breakpoint()
-        #     if adapter_name == "default":
-        #         func_names = self.reward_func_names_correctness
-        #     else:
-        #         func_names = self.reward_func_names_correctness + self.reward_func_names_diversity
-
-        #     if isinstance(adapter_advantages, torch.Tensor):
-        #         adapter_advantages_list = adapter_advantages.tolist()
-        #     else:
-        #         adapter_advantages_list = list(adapter_advantages)
-            
-        #     adapter_rewards = all_rewards_per_func[adapter_index]
-        #     gathered_adapter_rewards = gather_object(adapter_advantages_list)
-        #     self._logs["advantages"][adapter_name].extend(gathered_adapter_rewards)
-        #     # breakpoint()
-        #     for i, name in enumerate(func_names):
-        #         log_key = f"{adapter_name}/{name}"
-        #         if log_key not in self._logs["rewards"]:
-        #             self._logs["rewards"][log_key] = deque(maxlen=all_advantages.size(0))
-                    
-        #         reward_column = adapter_rewards[:, i].tolist()
-        #         gathered_rewards = gather_object(reward_column)
-        #         self._logs["rewards"][log_key].extend(gathered_rewards)
-                # self._logs["rewards"][log_key].extend(adapter_rewards[:, i].tolist())
-                # breakpoint()
-            # breakpoint()
-        
-        # if not isinstance(self._logs["advantages"], deque):
-        #     self._logs["advantages"] = deque(maxlen = all_advantages.size(0))
-        # self._logs["advantages"].extend(all_advantages.tolist())
-        # breakpoint()
-
         if self.use_vllm and self.vllm_importance_sampling_correction:
 
             for adapter_index, (adapter_name, (start_index, end_index)) in enumerate(
@@ -2908,163 +2968,140 @@ class ValSETrainer(BaseTrainer):
         else:
             return self._compute_loss(model, inputs)
 
-
     def _compute_loss(self, model, inputs):
-        device = self.accelerator.device
-        mode = "train" if model.training else "eval"
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        # breakpoint()
-        adapter_name = inputs["adapter_info"]["adapter_names"][0]
-        print(f"  >> [Loss Computation] Computing loss for adapter: {adapter_name}")
-        # breakpoint()
+            device = self.accelerator.device
+            mode = "train" if model.training else "eval"
+            prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+            completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep = completion_ids.size(1)  
 
-        total_loss = 0.0
-
-        # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            batch_size=self.args.per_device_train_batch_size,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            num_images=inputs.get("num_images"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-            token_type_ids=inputs.get("token_type_ids"),
-        )
-        # breakpoint()
-
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
-        else:
-            entropy_mask = None
-
-        # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-
-        # Compute the loss
-        advantages = inputs["advantages"]
-        # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
-        # old_per_token_logps == per_token_logps. In this case we can skip its computation
-        # (see _generate_and_score_completions) and instead use per_token_logps.detach().
-        # The exception is when using vLLM, where we always compute old_per_token_logps
-        # for importance sampling
-        old_per_token_logps = inputs.get("old_per_token_logps")
-        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-
-        log_ratio = per_token_logps - old_per_token_logps
-        if self.importance_sampling_level == "token":
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level == "sequence":
-            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
-            )
-        # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
-
-        coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-
-        # Two-sided clipping
-        if self.args.delta is not None:
-            coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-
-        if entropy_mask is not None:
-            per_token_loss = per_token_loss * entropy_mask
-
-        if self.use_vllm and self.vllm_importance_sampling_correction:
             adapter_name = inputs["adapter_info"]["adapter_names"][0]
-            if "importance_sampling_ratio_vllm" in inputs:
-                per_token_loss = per_token_loss * inputs["importance_sampling_ratio_vllm"]
-            elif "importance_sampling_ratio" in inputs:
-                per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+            # print(f"  >> [Loss Computation] Computing loss for adapter: {adapter_name}")
 
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
+            # Compute per-token logprobs
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                batch_size=self.args.per_device_train_batch_size,
+                compute_entropy=True,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                num_images=inputs.get("num_images"),
+                pixel_attention_mask=inputs.get("pixel_attention_mask"),
+                image_sizes=inputs.get("image_sizes"),
+                token_type_ids=inputs.get("token_type_ids"),
+            )
 
-        if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dapo":
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        # total_loss += loss
-
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
-
-        def masked_batch_mean(x):
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                return x.mean()
+            if self.top_entropy_quantile < 1.0:
+                entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
             else:
-                return (x * completion_mask).sum() / completion_token_count
+                entropy_mask = None
 
-        if self.beta != 0.0:
-            mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+            # Compute KL divergence
+            if self.beta != 0.0:
+                ref_per_token_logps = inputs["ref_per_token_logps"]
+                # [Stability Fix] Ensure gradients don't explode in KL
+                per_token_kl = (
+                    torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                )
+                # Optional: Clamp KL if necessary
+                # per_token_kl = torch.clamp(per_token_kl, max=100.0)
 
-        mean_entropy = masked_batch_mean(entropies)
-        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+            advantages = inputs["advantages"]
+            old_per_token_logps = inputs.get("old_per_token_logps")
+            old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
-        # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-
-        low_clip = masked_batch_mean(is_low_clipped.float())
-        high_clip = masked_batch_mean(is_high_clipped.float())
-        clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-        gathered_low_clip = self.accelerator.gather(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-        self._metrics[mode][f"entopy/{adapter_name}/mean"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-        if self.args.log_detailed_entropy_info is True:
-            position_entropy = (entropies * completion_mask).sum(0) / completion_token_count.clamp(min=1.0)
-            mean_position_entropy = position_entropy.mean()
+            # [Stability Fix] Clamp the log ratio to prevent exponential explosion
+            # rho = exp(log_p - log_old_p). If diff > 10, exp(10) ~ 22000, causing gradients to explode.
+            log_ratio = per_token_logps - old_per_token_logps
+            log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0) 
             
-            gathered_mean = self.accelerator.gather(mean_position_entropy)
-            self._metrics[mode][f"detailed_entropy/{adapter_name}/mean"].append(gathered_mean.nanmean().item())
-            self._metrics[mode][f"detailed_entropy/{adapter_name}/std"].append(self.accelerator.gather(position_entropy.std()).nanmean().item())
+            if self.importance_sampling_level == "token":
+                log_importance_weights = log_ratio
+            elif self.importance_sampling_level == "sequence":
+                log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+                log_importance_weights = log_importance_weights.unsqueeze(-1)
+            else:
+                raise ValueError(f"Unknown importance sampling level: {self.importance_sampling_level}")
 
-        # start_index = end_index
+            coef_1 = torch.exp(log_importance_weights)
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
 
-        # total_loss = total_loss / self.current_gradient_accumulation_steps
+            if self.args.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-        return loss
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+            if entropy_mask is not None:
+                per_token_loss = per_token_loss * entropy_mask
+
+            # vLLM Correction
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                if "importance_sampling_ratio_vllm" in inputs:
+                    per_token_loss = per_token_loss * inputs["importance_sampling_ratio_vllm"]
+                elif "importance_sampling_ratio" in inputs:
+                    # Clamp vLLM ratio as well
+                    ratio = inputs["importance_sampling_ratio"]
+                    ratio = torch.clamp(ratio, max=self.vllm_importance_sampling_cap)
+                    per_token_loss = per_token_loss * ratio
+
+            if self.beta != 0.0:
+                per_token_loss = per_token_loss + self.beta * per_token_kl
+
+            # Compute final scalar loss based on loss_type
+            if self.loss_type == "grpo":
+                loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            elif self.loss_type == "bnpo":
+                loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                loss = loss / self.current_gradient_accumulation_steps
+            elif self.loss_type == "dr_grpo":
+                loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+                loss = loss / self.current_gradient_accumulation_steps
+            elif self.loss_type == "dapo":
+                normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+                # Avoid division by zero
+                normalizer = torch.clamp(normalizer, min=1.0) 
+                loss = (per_token_loss * completion_mask).sum() / normalizer
+            else:
+                raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+            # [NaN Check] If loss is NaN or Inf, return a zero dummy loss with grad attached
+            if torch.isnan(loss) or torch.isinf(loss):
+                if self.accelerator.is_main_process:
+                    print(f"  !! [Warning] Loss is {loss.item()}. Returning zero loss to prevent crash.")
+                return loss.new_tensor(0.0, requires_grad=True)
+
+            # Logging metrics
+            completion_token_count = completion_mask.sum().clamp(min=1.0)
+            def masked_batch_mean(x):
+                if x.shape[1] == 1: 
+                    return x.mean()
+                else:
+                    return (x * completion_mask).sum() / completion_token_count
+
+            if self.beta != 0.0:
+                mean_kl = masked_batch_mean(per_token_kl)
+                self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+
+            mean_entropy = masked_batch_mean(entropies)
+            self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+            # Clip ratios logging
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
+            
+            clip_ratio = masked_batch_mean(is_region_clipped.float())
+            self._metrics[mode]["clip_ratio/region_mean"].append(self.accelerator.gather(clip_ratio).nanmean().item())
+            self._metrics[mode][f"entopy/{adapter_name}/mean"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+            return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         inputs = self._prepare_inputs(inputs)
@@ -3194,19 +3231,11 @@ class ValSETrainer(BaseTrainer):
             self._logs["rewards"].clear()
                 
 
-    # Ensure the model card is saved along with the checkpoint(Modified)
-    def _save_checkpoint(self, model, trial, metrics=None):
-        checkpoint_folder = f"{self.args.output_dir}/checkpoint-{self.state.global_step}"
-        os.makedirs(checkpoint_folder, exist_ok=True)
-        for adapter_name in self.adapter_names:
-            adapter_path = f"{checkpoint_folder}/{adapter_name}"
-            model.set_adapter(adapter_name)
-            model.save_pretrained(adapter_path, save_adapter=True, save_config=True, safe_serialization=True)
-        
+    # Ensure the model card is saved along with the checkpoint
+    def _save_checkpoint(self, model, trial):
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
-
         super()._save_checkpoint(model, trial)
